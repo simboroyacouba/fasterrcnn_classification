@@ -92,7 +92,22 @@ def find_model():
     if path and os.path.exists(path):
         return path
 
-    # Chercher dans output/
+    # Chercher dans runs/detect/train/ (dossier le plus récent en premier)
+    runs_base = os.path.join("runs", "detect", "train")
+    if os.path.exists(runs_base):
+        # Lister les sous-dossiers triés par date décroissante
+        subdirs = sorted(
+            [d for d in os.listdir(runs_base) if os.path.isdir(os.path.join(runs_base, d))],
+            reverse=True
+        )
+        for subdir in subdirs:
+            for fname in ["best_model.pth", "best.pth"]:
+                candidate = os.path.join(runs_base, subdir, fname)
+                if os.path.exists(candidate):
+                    print(f"📁 Modèle trouvé: {candidate}")
+                    return candidate
+
+    # Chercher aussi dans output/
     for root, dirs, files in os.walk("output"):
         for fname in ["best_model.pth", "best.pth"]:
             if fname in files:
@@ -308,12 +323,35 @@ def main():
     # Charger le modèle et récupérer les infos
     model, classes, cat_mapping = load_model(model_path, device)
 
-    # Trouver test_info.json (généré par train.py)
+    # Trouver test_info.json — chercher dans le même dossier que le modèle,
+    # puis dans runs/detect/train/ (le plus récent), puis dans output/
     test_info_path = None
-    for root, dirs, files in os.walk("output"):
-        if "test_info.json" in files:
-            test_info_path = os.path.join(root, "test_info.json")
-            break
+
+    # 1. Même répertoire que le modèle
+    sibling = os.path.join(os.path.dirname(model_path), "test_info.json")
+    if os.path.exists(sibling):
+        test_info_path = sibling
+
+    # 2. Dans runs/detect/train/ (le plus récent en premier)
+    if test_info_path is None:
+        runs_base = os.path.join("runs", "detect", "train")
+        if os.path.exists(runs_base):
+            subdirs = sorted(
+                [d for d in os.listdir(runs_base) if os.path.isdir(os.path.join(runs_base, d))],
+                reverse=True
+            )
+            for subdir in subdirs:
+                candidate = os.path.join(runs_base, subdir, "test_info.json")
+                if os.path.exists(candidate):
+                    test_info_path = candidate
+                    break
+
+    # 3. Dans output/
+    if test_info_path is None:
+        for root, dirs, files in os.walk("output"):
+            if "test_info.json" in files:
+                test_info_path = os.path.join(root, "test_info.json")
+                break
 
     if test_info_path is None:
         print("❌ test_info.json non trouvé! Lancez train.py d'abord.")
