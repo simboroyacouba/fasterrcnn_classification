@@ -82,12 +82,28 @@ def find_best_model():
     if path and os.path.exists(path):
         return path
 
+    # Chercher dans runs/detect/train/ (dossier le plus récent en premier)
+    runs_base = os.path.join("runs", "detect", "train")
+    if os.path.exists(runs_base):
+        subdirs = sorted(
+            [d for d in os.listdir(runs_base) if os.path.isdir(os.path.join(runs_base, d))],
+            reverse=True
+        )
+        for subdir in subdirs:
+            for fname in ["best_model.pth", "best.pth"]:
+                candidate = os.path.join(runs_base, subdir, fname)
+                if os.path.exists(candidate):
+                    print(f"📁 Modèle trouvé: {candidate}")
+                    return candidate
+
+    # Chercher dans output/
     for root, dirs, files in os.walk("output"):
         for fname in ["best_model.pth", "best.pth"]:
             if fname in files:
                 found = os.path.join(root, fname)
                 print(f"📁 Modèle trouvé: {found}")
                 return found
+
     return None
 
 
