@@ -259,19 +259,32 @@ class MetricsCalculator:
                 'F1': 2 * p * r / (p + r) if p + r > 0 else 0
             }
 
-        results['mAP50']    = results['overall']['iou_0.5']['Precision']
-        results['mAP50_95'] = float(np.mean([results['overall'][f'iou_{t}']['Precision'] for t in self.iou_thresholds]))
-
         results['mAP_per_class'] = {
             name: {
-                'AP50':    results['per_class'][name]['iou_0.5']['Precision'],
-                'AP50_95': float(np.mean([results['per_class'][name][f'iou_{t}']['Precision'] for t in self.iou_thresholds]))
+                'AP50':    float(results['per_class'][name]['iou_0.5']['Precision']),
+                'AP50_95': float(np.mean([results['per_class'][name][f'iou_{t}']['Precision']
+                                          for t in self.iou_thresholds]))
             }
             for name in self.class_names
         }
 
+        # ✅ mAP50 / mAP50:95 = macro-moyenne des AP par classe (correct)
+        results['mAP50']    = float(np.mean([results['mAP_per_class'][n]['AP50']    for n in self.class_names]))
+        results['mAP50_95'] = float(np.mean([results['mAP_per_class'][n]['AP50_95'] for n in self.class_names]))
+
+        # ✅ macro_avg = moyenne simple sur les classes (Precision, Recall, F1 cohérents)
+        results['macro_avg'] = {
+            'Precision': float(np.mean([results['per_class'][n]['iou_0.5']['Precision'] for n in self.class_names])),
+            'Recall':    float(np.mean([results['per_class'][n]['iou_0.5']['Recall']    for n in self.class_names])),
+            'F1':        float(np.mean([results['per_class'][n]['iou_0.5']['F1']        for n in self.class_names])),
+        }
+        # overall['iou_0.5'] conservé pour compatibilité (micro-average TP/FP agrégé)
+
         if self.all_ious:
-            results['iou_stats'] = {'mean': float(np.mean(self.all_ious)), 'median': float(np.median(self.all_ious))}
+            results['iou_stats'] = {
+                'mean':   float(np.mean(self.all_ious)),
+                'median': float(np.median(self.all_ious))
+            }
 
         return results
 
@@ -409,11 +422,12 @@ def main():
     print("   📊 RÉSULTATS SUR LE TEST SET")
     print("=" * 70)
     print(f"   Images testées: {len(test_image_ids)}")
+    ma = results['macro_avg']
     print(f"   mAP@50:    {results['mAP50']:.4f} ({results['mAP50']*100:.2f}%)")
     print(f"   mAP@50:95: {results['mAP50_95']:.4f}")
-    print(f"   Precision: {results['overall']['iou_0.5']['Precision']:.4f}")
-    print(f"   Recall:    {results['overall']['iou_0.5']['Recall']:.4f}")
-    print(f"   F1-Score:  {results['overall']['iou_0.5']['F1']:.4f}")
+    print(f"   Precision: {ma['Precision']:.4f}   (macro-moyenne par classe)")
+    print(f"   Recall:    {ma['Recall']:.4f}   (macro-moyenne par classe)")
+    print(f"   F1-Score:  {ma['F1']:.4f}   (macro-moyenne par classe)")
     print("=" * 70)
 
     if results['mAP_per_class']:
@@ -433,11 +447,12 @@ def main():
         f.write("=" * 50 + "\n\n")
         f.write(f"Images testées: {len(test_image_ids)}\n")
         f.write(f"Modèle: {model_path}\n\n")
+        ma = results['macro_avg']
         f.write(f"mAP@50: {results['mAP50']:.4f} ({results['mAP50']*100:.2f}%)\n")
         f.write(f"mAP@50:95: {results['mAP50_95']:.4f}\n")
-        f.write(f"Precision: {results['overall']['iou_0.5']['Precision']:.4f}\n")
-        f.write(f"Recall: {results['overall']['iou_0.5']['Recall']:.4f}\n")
-        f.write(f"F1-Score: {results['overall']['iou_0.5']['F1']:.4f}\n")
+        f.write(f"Precision: {ma['Precision']:.4f}\n")
+        f.write(f"Recall: {ma['Recall']:.4f}\n")
+        f.write(f"F1-Score: {ma['F1']:.4f}\n")
         if results['mAP_per_class']:
             f.write("\n\nPAR CLASSE (IoU=0.5)\n")
             f.write("-" * 50 + "\n")
