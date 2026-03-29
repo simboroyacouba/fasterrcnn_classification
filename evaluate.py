@@ -53,7 +53,7 @@ CONFIG = {
     "classes_file": os.getenv("CLASSES_FILE", "classes.yaml"),
     "classes":      None,
     "image_size":   int(os.getenv("IMAGE_SIZE", "640")),
-    "score_threshold": float(os.getenv("SCORE_THRESHOLD", "0.5")),
+    "score_threshold": float(os.getenv("SCORE_THRESHOLD", "0.3")),  # Faster R-CNN : 0.3 recommandé (scores naturellement plus bas que YOLO)
     "iou_thresholds": [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95],
 }
 CONFIG["classes"] = load_classes(CONFIG["classes_file"])
@@ -422,6 +422,7 @@ def main():
     print("   📊 RÉSULTATS SUR LE TEST SET")
     print("=" * 70)
     print(f"   Images testées: {len(test_image_ids)}")
+    print(f"   Score threshold: {CONFIG['score_threshold']}")
     ma = results['macro_avg']
     print(f"   mAP@50:    {results['mAP50']:.4f} ({results['mAP50']*100:.2f}%)")
     print(f"   mAP@50:95: {results['mAP50_95']:.4f}")
@@ -446,7 +447,8 @@ def main():
         f.write(f"ÉVALUATION Faster R-CNN - TEST SET - {datetime.now()}\n")
         f.write("=" * 50 + "\n\n")
         f.write(f"Images testées: {len(test_image_ids)}\n")
-        f.write(f"Modèle: {model_path}\n\n")
+        f.write(f"Modèle: {model_path}\n")
+        f.write(f"Score threshold: {CONFIG['score_threshold']}\n\n")
         ma = results['macro_avg']
         f.write(f"mAP@50: {results['mAP50']:.4f} ({results['mAP50']*100:.2f}%)\n")
         f.write(f"mAP@50:95: {results['mAP50_95']:.4f}\n")

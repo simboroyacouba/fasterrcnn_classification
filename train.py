@@ -187,10 +187,12 @@ class CocoDetectionDataset(Dataset):
         # Convertir en tensor [C,H,W] dans [0,1]
         image_tensor = TF.to_tensor(image)
 
-        # ✅ FIX 1 — Normalisation ImageNet (requis par ResNet-50 pré-entraîné)
-        image_tensor = TF.normalize(image_tensor,
-                                    mean=IMAGENET_MEAN,
-                                    std=IMAGENET_STD)
+        # ⚠️  NORMALISATION IMAGENET — À activer si tu réentraînes depuis zéro
+        # Le modèle existant (fasterrcnn_20260329_164302) a été entraîné SANS normalisation.
+        # Si tu réentraînes, décommente ces 3 lignes ET réentraîne evaluate.py aussi.
+        # image_tensor = TF.normalize(image_tensor,
+        #                             mean=IMAGENET_MEAN,
+        #                             std=IMAGENET_STD)
 
         # Annotations
         anns   = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id))
@@ -392,7 +394,7 @@ def train_fasterrcnn():
     print(f"   Classes:     {num_classes} (avec __background__)")
     print(f"   Epochs:      {CONFIG['num_epochs']} | Batch: {CONFIG['batch_size']} | LR: {CONFIG['learning_rate']}")
     print(f"   Image size:  {CONFIG['image_size']}px")
-    print(f"   ✅ Normalisation ImageNet activée")
+    print(f"   ⚠️  Normalisation ImageNet désactivée (compatibilité modèle existant)")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"   Device:      {device}")
@@ -569,7 +571,7 @@ def train_fasterrcnn():
         f.write(f"Dataset:        {CONFIG['images_dir']}\n")
         f.write(f"Classes:        {CONFIG['classes']}\n")
         f.write(f"Epochs:         {CONFIG['num_epochs']} | Batch: {CONFIG['batch_size']}\n")
-        f.write(f"Normalisation:  ImageNet (mean={IMAGENET_MEAN}, std={IMAGENET_STD})\n\n")
+        f.write(f"Normalisation:  Désactivée (compatibilité modèle existant)\n\n")
         f.write(f"Meilleur mAP@50: {best_map50:.4f} ({best_map50*100:.2f}%)\n")
         f.write(f"Temps total:     {format_time(total_time)}\n")
         f.write(f"Chemin:          {train_dir}\n")
