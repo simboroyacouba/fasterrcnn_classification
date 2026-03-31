@@ -138,11 +138,28 @@ class TestDataset(Dataset):
 
         image = Image.open(img_path).convert("RGB")
         orig_w, orig_h = image.size
-        image = image.resize((self.image_size, self.image_size))
-        scale_x = self.image_size / orig_w
-        scale_y = self.image_size / orig_h
+
+        # ✅ Resize sans déformation — même letterbox que train.py
+        ratio   = min(self.image_size / orig_w, self.image_size / orig_h)
+        new_w   = int(orig_w * ratio)
+        new_h   = int(orig_h * ratio)
+        image   = image.resize((new_w, new_h), Image.BILINEAR)
+
+        canvas  = Image.new("RGB", (self.image_size, self.image_size), (0, 0, 0))
+        pad_x   = (self.image_size - new_w) // 2
+        pad_y   = (self.image_size - new_h) // 2
+        canvas.paste(image, (pad_x, pad_y))
+        image   = canvas
+
+        scale_x = ratio
+        scale_y = ratio
 
         image_tensor = TF.to_tensor(image)
+
+        # ✅ Normalisation ImageNet — cohérente avec train.py
+        image_tensor = TF.normalize(image_tensor,
+                                    mean=[0.485, 0.456, 0.406],
+                                    std=[0.229, 0.224, 0.225])
 
         anns = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id))
         boxes, labels = [], []
@@ -155,9 +172,9 @@ class TestDataset(Dataset):
             x, y, w, h = ann['bbox']
             if w <= 0 or h <= 0:
                 continue
-            x1 = max(0, x * scale_x); y1 = max(0, y * scale_y)
-            x2 = min(self.image_size, (x + w) * scale_x)
-            y2 = min(self.image_size, (y + h) * scale_y)
+            x1 = max(0, x * scale_x + pad_x); y1 = max(0, y * scale_y + pad_y)
+            x2 = min(self.image_size, (x + w) * scale_x + pad_x)
+            y2 = min(self.image_size, (y + h) * scale_y + pad_y)
             if x2 > x1 and y2 > y1:
                 boxes.append([x1, y1, x2, y2])
                 labels.append(class_id)

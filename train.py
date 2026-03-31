@@ -180,19 +180,31 @@ class CocoDetectionDataset(Dataset):
 
         image = Image.open(img_path).convert("RGB")
         orig_w, orig_h = image.size
-        image = image.resize((self.image_size, self.image_size))
-        scale_x = self.image_size / orig_w
-        scale_y = self.image_size / orig_h
+
+        # ✅ Resize sans déformation — padding avec noir pour conserver le ratio
+        ratio   = min(self.image_size / orig_w, self.image_size / orig_h)
+        new_w   = int(orig_w * ratio)
+        new_h   = int(orig_h * ratio)
+        image   = image.resize((new_w, new_h), Image.BILINEAR)
+
+        # Créer une image carrée avec padding noir
+        canvas  = Image.new("RGB", (self.image_size, self.image_size), (0, 0, 0))
+        pad_x   = (self.image_size - new_w) // 2
+        pad_y   = (self.image_size - new_h) // 2
+        canvas.paste(image, (pad_x, pad_y))
+        image   = canvas
+
+        # Facteurs d'échelle pour ajuster les bounding boxes
+        scale_x = ratio
+        scale_y = ratio
 
         # Convertir en tensor [C,H,W] dans [0,1]
         image_tensor = TF.to_tensor(image)
 
-        # ⚠️  NORMALISATION IMAGENET — À activer si tu réentraînes depuis zéro
-        # Le modèle existant (fasterrcnn_20260329_164302) a été entraîné SANS normalisation.
-        # Si tu réentraînes, décommente ces 3 lignes ET réentraîne evaluate.py aussi.
-        # image_tensor = TF.normalize(image_tensor,
-        #                             mean=IMAGENET_MEAN,
-        #                             std=IMAGENET_STD)
+        # ✅ Normalisation ImageNet — requise par ResNet-50 pré-entraîné
+        image_tensor = TF.normalize(image_tensor,
+                                    mean=IMAGENET_MEAN,
+                                    std=IMAGENET_STD)
 
         # Annotations
         anns   = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id))
@@ -208,10 +220,10 @@ class CocoDetectionDataset(Dataset):
             x, y, w, h = ann['bbox']
             if w <= 0 or h <= 0:
                 continue
-            x1 = max(0, x * scale_x)
-            y1 = max(0, y * scale_y)
-            x2 = min(self.image_size, (x + w) * scale_x)
-            y2 = min(self.image_size, (y + h) * scale_y)
+            x1 = max(0, x * scale_x + pad_x)
+            y1 = max(0, y * scale_y + pad_y)
+            x2 = min(self.image_size, (x + w) * scale_x + pad_x)
+            y2 = min(self.image_size, (y + h) * scale_y + pad_y)
             if x2 > x1 and y2 > y1:
                 boxes.append([x1, y1, x2, y2])
                 labels.append(class_id)
@@ -394,7 +406,8 @@ def train_fasterrcnn():
     print(f"   Classes:     {num_classes} (avec __background__)")
     print(f"   Epochs:      {CONFIG['num_epochs']} | Batch: {CONFIG['batch_size']} | LR: {CONFIG['learning_rate']}")
     print(f"   Image size:  {CONFIG['image_size']}px")
-    print(f"   ⚠️  Normalisation ImageNet désactivée (compatibilité modèle existant)")
+    print(f"   ✅ Normalisation ImageNet activée")
+    print(f"   ✅ Resize sans déformation (letterbox padding)")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"   Device:      {device}")
@@ -571,7 +584,8 @@ def train_fasterrcnn():
         f.write(f"Dataset:        {CONFIG['images_dir']}\n")
         f.write(f"Classes:        {CONFIG['classes']}\n")
         f.write(f"Epochs:         {CONFIG['num_epochs']} | Batch: {CONFIG['batch_size']}\n")
-        f.write(f"Normalisation:  Désactivée (compatibilité modèle existant)\n\n")
+        f.write(f"Normalisation:  ImageNet (mean={IMAGENET_MEAN}, std={IMAGENET_STD})\n")
+        f.write(f"Resize:         Letterbox sans déformation\n\n")
         f.write(f"Meilleur mAP@50: {best_map50:.4f} ({best_map50*100:.2f}%)\n")
         f.write(f"Temps total:     {format_time(total_time)}\n")
         f.write(f"Chemin:          {train_dir}\n")
