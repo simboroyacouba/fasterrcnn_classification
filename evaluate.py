@@ -139,35 +139,22 @@ class TestDataset(Dataset):
         image = Image.open(img_path).convert("RGB")
         orig_w, orig_h = image.size
 
-        # ═══════════════════════════════════════════════════════════════════════
-        # CHOISIR LE BLOC QUI CORRESPOND AU MODÈLE UTILISÉ
-        # ═══════════════════════════════════════════════════════════════════════
+        # ✅ Letterbox resize — cohérent avec train.py
+        ratio        = min(self.image_size / orig_w, self.image_size / orig_h)
+        new_w, new_h = int(orig_w * ratio), int(orig_h * ratio)
+        image        = image.resize((new_w, new_h), Image.BILINEAR)
+        canvas       = Image.new("RGB", (self.image_size, self.image_size), (0, 0, 0))
+        pad_x        = (self.image_size - new_w) // 2
+        pad_y        = (self.image_size - new_h) // 2
+        canvas.paste(image, (pad_x, pad_y))
+        image        = canvas
+        scale_x, scale_y = ratio, ratio
 
-        # ── BLOC A : modèle existant (simple resize, sans normalisation) ──────
-        # Modèles entraînés avec l'ancien train.py → utiliser ce bloc
-        image   = image.resize((self.image_size, self.image_size))
-        scale_x = self.image_size / orig_w
-        scale_y = self.image_size / orig_h
-        pad_x, pad_y = 0, 0
+        # ✅ Normalisation ImageNet — cohérente avec train.py
         image_tensor = TF.to_tensor(image)
-
-        # ── BLOC B : nouveau modèle (letterbox + normalisation ImageNet) ──────
-        # Modèles entraînés avec le nouveau train.py → commenter A, décommenter B
-        # ratio   = min(self.image_size / orig_w, self.image_size / orig_h)
-        # new_w, new_h = int(orig_w * ratio), int(orig_h * ratio)
-        # image   = image.resize((new_w, new_h), Image.BILINEAR)
-        # canvas  = Image.new("RGB", (self.image_size, self.image_size), (0, 0, 0))
-        # pad_x   = (self.image_size - new_w) // 2
-        # pad_y   = (self.image_size - new_h) // 2
-        # canvas.paste(image, (pad_x, pad_y))
-        # image   = canvas
-        # scale_x, scale_y = ratio, ratio
-        # image_tensor = TF.to_tensor(image)
-        # image_tensor = TF.normalize(image_tensor,
-        #                             mean=[0.485, 0.456, 0.406],
-        #                             std=[0.229, 0.224, 0.225])
-
-        # ═══════════════════════════════════════════════════════════════════════
+        image_tensor = TF.normalize(image_tensor,
+                                    mean=[0.485, 0.456, 0.406],
+                                    std=[0.229, 0.224, 0.225])
 
         anns = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id))
         boxes, labels = [], []
