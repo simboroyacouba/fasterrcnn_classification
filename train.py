@@ -70,7 +70,7 @@ CONFIG = {
     "learning_rate":     float(os.getenv("LEARNING_RATE", "0.005")),
     "momentum":          float(os.getenv("MOMENTUM", "0.9")),
     "weight_decay":      float(os.getenv("WEIGHT_DECAY", "0.0005")),
-    "image_size":        int(os.getenv("IMAGE_SIZE", "640")),
+    "image_size":        int(os.getenv("IMAGE_SIZE", "1280")),
     "train_split":       float(os.getenv("TRAIN_SPLIT", "0.70")),
     "val_split":         float(os.getenv("VAL_SPLIT", "0.20")),
     "test_split":        float(os.getenv("TEST_SPLIT", "0.10")),
