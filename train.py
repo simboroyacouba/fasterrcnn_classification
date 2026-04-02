@@ -446,7 +446,7 @@ def train_fasterrcnn():
                                 lr=CONFIG["learning_rate"],
                                 momentum=CONFIG["momentum"],
                                 weight_decay=CONFIG["weight_decay"])
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.2)
 
     # -------------------------------------------------------------------------
     # Boucle d'entraînement
