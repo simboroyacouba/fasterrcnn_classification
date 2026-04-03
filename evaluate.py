@@ -53,7 +53,7 @@ CONFIG = {
     "classes_file": os.getenv("CLASSES_FILE", "classes.yaml"),
     "classes":      None,
     "image_size":   int(os.getenv("IMAGE_SIZE", "640")),
-    "score_threshold": float(os.getenv("SCORE_THRESHOLD", "0.5")),
+    "score_threshold": float(os.getenv("SCORE_THRESHOLD", "0.3")),  # Faster R-CNN : 0.3 recommandé (scores naturellement plus bas que YOLO)
     "iou_thresholds": [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95],
 }
 CONFIG["classes"] = load_classes(CONFIG["classes_file"])
@@ -138,11 +138,24 @@ class TestDataset(Dataset):
 
         image = Image.open(img_path).convert("RGB")
         orig_w, orig_h = image.size
-        image = image.resize((self.image_size, self.image_size))
-        scale_x = self.image_size / orig_w
-        scale_y = self.image_size / orig_h
 
+        # ✅ Letterbox resize — identique à train.py
+        ratio        = min(self.image_size / orig_w, self.image_size / orig_h)
+        new_w, new_h = int(orig_w * ratio), int(orig_h * ratio)
+        image        = image.resize((new_w, new_h), Image.BILINEAR)
+        canvas       = Image.new("RGB", (self.image_size, self.image_size), (0, 0, 0))
+        pad_x        = (self.image_size - new_w) // 2
+        pad_y        = (self.image_size - new_h) // 2
+        canvas.paste(image, (pad_x, pad_y))
+        image        = canvas
+        scale_x      = ratio
+        scale_y      = ratio
+
+        # ✅ Normalisation ImageNet — identique à train.py
         image_tensor = TF.to_tensor(image)
+        image_tensor = TF.normalize(image_tensor,
+                                    mean=[0.485, 0.456, 0.406],
+                                    std=[0.229, 0.224, 0.225])
 
         anns = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id))
         boxes, labels = [], []
@@ -155,10 +168,10 @@ class TestDataset(Dataset):
             x, y, w, h = ann['bbox']
             if w <= 0 or h <= 0:
                 continue
-            x1 = max(0, x * scale_x); y1 = max(0, y * scale_y)
-            x2 = min(self.image_size, (x + w) * scale_x)
-            y2 = min(self.image_size, (y + h) * scale_y)
-            if x2 > x1 and y2 > y1:
+            x1 = max(0, x * scale_x + pad_x); y1 = max(0, y * scale_y + pad_y)
+            x2 = min(self.image_size, (x + w) * scale_x + pad_x)
+            y2 = min(self.image_size, (y + h) * scale_y + pad_y)
+                if x2 > x1 and y2 > y1:
                 boxes.append([x1, y1, x2, y2])
                 labels.append(class_id)
 
@@ -259,19 +272,32 @@ class MetricsCalculator:
                 'F1': 2 * p * r / (p + r) if p + r > 0 else 0
             }
 
-        results['mAP50']    = results['overall']['iou_0.5']['Precision']
-        results['mAP50_95'] = float(np.mean([results['overall'][f'iou_{t}']['Precision'] for t in self.iou_thresholds]))
-
         results['mAP_per_class'] = {
             name: {
-                'AP50':    results['per_class'][name]['iou_0.5']['Precision'],
-                'AP50_95': float(np.mean([results['per_class'][name][f'iou_{t}']['Precision'] for t in self.iou_thresholds]))
+                'AP50':    float(results['per_class'][name]['iou_0.5']['Precision']),
+                'AP50_95': float(np.mean([results['per_class'][name][f'iou_{t}']['Precision']
+                                          for t in self.iou_thresholds]))
             }
             for name in self.class_names
         }
 
+        # ✅ mAP50 / mAP50:95 = macro-moyenne des AP par classe (correct)
+        results['mAP50']    = float(np.mean([results['mAP_per_class'][n]['AP50']    for n in self.class_names]))
+        results['mAP50_95'] = float(np.mean([results['mAP_per_class'][n]['AP50_95'] for n in self.class_names]))
+
+        # ✅ macro_avg = moyenne simple sur les classes (Precision, Recall, F1 cohérents)
+        results['macro_avg'] = {
+            'Precision': float(np.mean([results['per_class'][n]['iou_0.5']['Precision'] for n in self.class_names])),
+            'Recall':    float(np.mean([results['per_class'][n]['iou_0.5']['Recall']    for n in self.class_names])),
+            'F1':        float(np.mean([results['per_class'][n]['iou_0.5']['F1']        for n in self.class_names])),
+        }
+        # overall['iou_0.5'] conservé pour compatibilité (micro-average TP/FP agrégé)
+
         if self.all_ious:
-            results['iou_stats'] = {'mean': float(np.mean(self.all_ious)), 'median': float(np.median(self.all_ious))}
+            results['iou_stats'] = {
+                'mean':   float(np.mean(self.all_ious)),
+                'median': float(np.median(self.all_ious))
+            }
 
         return results
 
@@ -409,11 +435,13 @@ def main():
     print("   📊 RÉSULTATS SUR LE TEST SET")
     print("=" * 70)
     print(f"   Images testées: {len(test_image_ids)}")
+    print(f"   Score threshold: {CONFIG['score_threshold']}")
+    ma = results['macro_avg']
     print(f"   mAP@50:    {results['mAP50']:.4f} ({results['mAP50']*100:.2f}%)")
     print(f"   mAP@50:95: {results['mAP50_95']:.4f}")
-    print(f"   Precision: {results['overall']['iou_0.5']['Precision']:.4f}")
-    print(f"   Recall:    {results['overall']['iou_0.5']['Recall']:.4f}")
-    print(f"   F1-Score:  {results['overall']['iou_0.5']['F1']:.4f}")
+    print(f"   Precision: {ma['Precision']:.4f}   (macro-moyenne par classe)")
+    print(f"   Recall:    {ma['Recall']:.4f}   (macro-moyenne par classe)")
+    print(f"   F1-Score:  {ma['F1']:.4f}   (macro-moyenne par classe)")
     print("=" * 70)
 
     if results['mAP_per_class']:
@@ -432,12 +460,14 @@ def main():
         f.write(f"ÉVALUATION Faster R-CNN - TEST SET - {datetime.now()}\n")
         f.write("=" * 50 + "\n\n")
         f.write(f"Images testées: {len(test_image_ids)}\n")
-        f.write(f"Modèle: {model_path}\n\n")
+        f.write(f"Modèle: {model_path}\n")
+        f.write(f"Score threshold: {CONFIG['score_threshold']}\n\n")
+        ma = results['macro_avg']
         f.write(f"mAP@50: {results['mAP50']:.4f} ({results['mAP50']*100:.2f}%)\n")
         f.write(f"mAP@50:95: {results['mAP50_95']:.4f}\n")
-        f.write(f"Precision: {results['overall']['iou_0.5']['Precision']:.4f}\n")
-        f.write(f"Recall: {results['overall']['iou_0.5']['Recall']:.4f}\n")
-        f.write(f"F1-Score: {results['overall']['iou_0.5']['F1']:.4f}\n")
+        f.write(f"Precision: {ma['Precision']:.4f}\n")
+        f.write(f"Recall: {ma['Recall']:.4f}\n")
+        f.write(f"F1-Score: {ma['F1']:.4f}\n")
         if results['mAP_per_class']:
             f.write("\n\nPAR CLASSE (IoU=0.5)\n")
             f.write("-" * 50 + "\n")
