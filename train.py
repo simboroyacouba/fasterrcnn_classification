@@ -83,10 +83,9 @@ CONFIG = {
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
-# Classes minoritaires — augmentation plus agressive pour compenser le déséquilibre
-# batiment_peint (153 ann.) et batiment_enduit (496 ann.) vs panneau_solaire (1787 ann.)
-RARE_CLASSES  = {'batiment_peint', 'batiment_enduit'}
-IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+# Classes minoritaires — augmentation plus agressive
+RARE_CLASSES = {'batiment_peint', 'batiment_enduit'}
 
 
 # =============================================================================
@@ -188,46 +187,42 @@ class CocoDetectionDataset(Dataset):
         image = Image.open(img_path).convert("RGB")
         orig_w, orig_h = image.size
 
-        # ✅ Letterbox resize
-        ratio        = min(self.image_size / orig_w, self.image_size / orig_h)
-        new_w, new_h = int(orig_w * ratio), int(orig_h * ratio)
-        image        = image.resize((new_w, new_h), Image.BILINEAR)
-        canvas       = Image.new("RGB", (self.image_size, self.image_size), (0, 0, 0))
-        pad_x        = (self.image_size - new_w) // 2
-        pad_y        = (self.image_size - new_h) // 2
-        canvas.paste(image, (pad_x, pad_y))
-        image   = canvas
-        scale_x = ratio
-        scale_y = ratio
+        # Resize inchangé
+        image   = TF.resize(image, self.image_size)
+        scale_x = self.image_size / orig_w
+        scale_y = self.image_size / orig_h
 
-        # ✅ Détecter si l'image contient des classes rares
+        # Détecter si l'image contient des classes rares
         anns_check = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id))
-        cat_ids_in_image = {
+        cat_names_in_image = {
             self.coco.cats[a['category_id']]['name']
             for a in anns_check if not a.get('iscrowd', 0)
         }
-        has_rare = bool(cat_ids_in_image & RARE_CLASSES)
+        has_rare = bool(cat_names_in_image & RARE_CLASSES)
 
-        # ✅ Data augmentation (entraînement seulement)
+        # ✅ Augmentation ciblée — plus agressive si classe rare
         do_hflip = do_vflip = False
         if self.augment:
+            # Flip horizontal — toutes les images 50%
             do_hflip = _rnd.random() > 0.5
-            do_vflip = _rnd.random() > (0.5 if has_rare else 0.8)
+            # Flip vertical — 50% si rare, 15% sinon
+            do_vflip = _rnd.random() > (0.5 if has_rare else 0.85)
 
             if do_hflip: image = TF.hflip(image)
             if do_vflip: image = TF.vflip(image)
 
-            jitter = 0.3 if has_rare else 0.2
-            image = TF.adjust_brightness(image, 1.0 + _rnd.uniform(-jitter, jitter))
-            image = TF.adjust_contrast(image,   1.0 + _rnd.uniform(-jitter, jitter))
-            image = TF.adjust_saturation(image, 1.0 + _rnd.uniform(-jitter, jitter))
+            # Colorjitter — ±30% si rare, ±15% sinon
+            j = 0.30 if has_rare else 0.15
+            image = TF.adjust_brightness(image, 1.0 + _rnd.uniform(-j, j))
+            image = TF.adjust_contrast(image,   1.0 + _rnd.uniform(-j, j))
+            image = TF.adjust_saturation(image, 1.0 + _rnd.uniform(-j, j))
 
+            # Rotation ±15° — seulement si rare
             if has_rare and _rnd.random() > 0.5:
                 image = TF.rotate(image, _rnd.uniform(-15, 15), fill=0)
 
-        # ✅ Tensor + normalisation ImageNet
+        # Convertir en tensor [C,H,W] dans [0,1]
         image_tensor = TF.to_tensor(image)
-        image_tensor = TF.normalize(image_tensor, mean=IMAGENET_MEAN, std=IMAGENET_STD)
 
         # Annotations
         anns   = anns_check
@@ -243,10 +238,10 @@ class CocoDetectionDataset(Dataset):
             x, y, w, h = ann['bbox']
             if w <= 0 or h <= 0:
                 continue
-            x1 = max(0, x * scale_x + pad_x)
-            y1 = max(0, y * scale_y + pad_y)
-            x2 = min(self.image_size, (x + w) * scale_x + pad_x)
-            y2 = min(self.image_size, (y + h) * scale_y + pad_y)
+            x1 = max(0, x * scale_x)
+            y1 = max(0, y * scale_y)
+            x2 = min(self.image_size, (x + w) * scale_x)
+            y2 = min(self.image_size, (y + h) * scale_y)
             if x2 > x1 and y2 > y1:
                 if do_hflip: x1, x2 = self.image_size - x2, self.image_size - x1
                 if do_vflip: y1, y2 = self.image_size - y2, self.image_size - y1
@@ -432,8 +427,6 @@ def train_fasterrcnn():
     print(f"   Classes:     {num_classes} (avec __background__)")
     print(f"   Epochs:      {CONFIG['num_epochs']} | Batch: {CONFIG['batch_size']} | LR: {CONFIG['learning_rate']}")
     print(f"   Image size:  {CONFIG['image_size']}px")
-    print(f"   ✅ Letterbox + Normalisation ImageNet + Augmentation classes rares")
-    print(f"   Image size:  {CONFIG['image_size']}px")
     print(f"   ⚠️  Normalisation ImageNet désactivée (compatibilité modèle existant)")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -499,7 +492,7 @@ def train_fasterrcnn():
     print("=" * 70)
 
     history = {
-        'train_loss': [], 'val_map50': [], 'val_ap_per_class': [], 'val_ap_per_class': [],
+        'train_loss': [], 'val_map50': [], 'val_ap_per_class': [],
         'loss_classifier': [], 'loss_box_reg': [],
         'loss_objectness': [], 'loss_rpn_box_reg': [], 'lr': [],
     }
@@ -519,7 +512,6 @@ def train_fasterrcnn():
         history['train_loss'].append(avg_loss)
         history['val_map50'].append(val_map50)
         history['val_ap_per_class'].append(val_aps)
-        history['val_ap_per_class'].append(val_aps)
         history['loss_classifier'].append(losses_dict['loss_classifier'])
         history['loss_box_reg'].append(losses_dict['loss_box_reg'])
         history['loss_objectness'].append(losses_dict['loss_objectness'])
@@ -528,8 +520,6 @@ def train_fasterrcnn():
 
         epoch_time = time.time() - epoch_start
         print(f"   Loss: {avg_loss:.4f} | mAP@50: {val_map50:.4f} | LR: {current_lr:.6f} | ⏱️ {format_time(epoch_time)}")
-        for name, ap in val_aps.items():
-            print(f"      {name:<30} AP={ap:.3f}")
         for name, ap in val_aps.items():
             print(f"      {name:<30} AP={ap:.3f}")
 
