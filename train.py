@@ -187,7 +187,7 @@ class CocoDetectionDataset(Dataset):
         image = Image.open(img_path).convert("RGB")
         orig_w, orig_h = image.size
 
-        # Resize inchangé
+        # Redimensionner (inchangé)
         image   = TF.resize(image, self.image_size)
         scale_x = self.image_size / orig_w
         scale_y = self.image_size / orig_h
@@ -221,7 +221,7 @@ class CocoDetectionDataset(Dataset):
             if has_rare and _rnd.random() > 0.5:
                 image = TF.rotate(image, _rnd.uniform(-15, 15), fill=0)
 
-        # Convertir en tensor [C,H,W] dans [0,1]
+        # Convertir en tensor [C, H, W] float32 dans [0, 1]
         image_tensor = TF.to_tensor(image)
 
         # Annotations
