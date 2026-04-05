@@ -3,11 +3,6 @@ Entraînement Faster R-CNN pour détection des toitures cadastrales
 Dataset: Images aériennes annotées avec CVAT (format COCO)
 Classes: Chargées depuis classes.yaml
 Configuration: Chargée depuis .env
-
-CORRECTIONS APPLIQUÉES:
-  1. Normalisation ImageNet ajoutée dans le Dataset (cause principale des mauvaises métriques)
-  2. compute_map() corrigé: macro-moyenne des AP par classe (cohérent avec evaluate.py)
-  3. test_info.json: chemins absolus + image_size sauvegardé
 """
 
 import os
@@ -19,6 +14,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from datetime import datetime
 import time
+import gc
 import torch
 import torchvision
 from torchvision.models.detection import fasterrcnn_resnet50_fpn, FasterRCNN_ResNet50_FPN_Weights
@@ -41,11 +37,13 @@ except ImportError:
 # =============================================================================
 
 def load_classes(yaml_path="classes.yaml"):
+    """Charger toutes les classes depuis YAML (avec __background__)"""
     if not os.path.exists(yaml_path):
         raise FileNotFoundError(f"Fichier introuvable: {yaml_path}")
     with open(yaml_path, 'r', encoding='utf-8') as f:
         data = yaml.safe_load(f)
     classes = data.get('classes', [])
+    # S'assurer que __background__ est en index 0
     if '__background__' not in classes:
         classes = ['__background__'] + classes
     print(f"📋 Classes chargées depuis {yaml_path}:")
@@ -65,12 +63,13 @@ CONFIG = {
     "classes_file":      os.getenv("CLASSES_FILE", "classes.yaml"),
     "classes":           None,
 
+    # Hyperparamètres
     "num_epochs":        int(os.getenv("NUM_EPOCHS", "25")),
     "batch_size":        int(os.getenv("BATCH_SIZE", "2")),
     "learning_rate":     float(os.getenv("LEARNING_RATE", "0.005")),
     "momentum":          float(os.getenv("MOMENTUM", "0.9")),
     "weight_decay":      float(os.getenv("WEIGHT_DECAY", "0.0005")),
-    "image_size":        int(os.getenv("IMAGE_SIZE", "1280")),
+    "image_size":        int(os.getenv("IMAGE_SIZE", "640")),
     "train_split":       float(os.getenv("TRAIN_SPLIT", "0.70")),
     "val_split":         float(os.getenv("VAL_SPLIT", "0.20")),
     "test_split":        float(os.getenv("TEST_SPLIT", "0.10")),
@@ -78,10 +77,6 @@ CONFIG = {
     "score_threshold":   float(os.getenv("SCORE_THRESHOLD", "0.5")),
     "pretrained":        os.getenv("PRETRAINED", "true").lower() == "true",
 }
-
-# ✅ Normalisation ImageNet — requise par ResNet-50 pré-entraîné
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD  = [0.229, 0.224, 0.225]
 
 
 # =============================================================================
@@ -159,16 +154,15 @@ def print_split_stats(coco, stats):
 # =============================================================================
 
 class CocoDetectionDataset(Dataset):
-    """Dataset COCO pour Faster R-CNN avec normalisation ImageNet"""
+    """Dataset COCO pour Faster R-CNN"""
 
-    def __init__(self, images_dir, annotations_file, image_ids,
-                 cat_mapping, image_size=640, augment=False):
-        self.images_dir  = images_dir
-        self.coco        = COCO(annotations_file)
-        self.image_ids   = image_ids
-        self.cat_mapping = cat_mapping
-        self.image_size  = image_size
-        self.augment     = augment
+    def __init__(self, images_dir, annotations_file, image_ids, cat_mapping, image_size=640, augment=False):
+        self.images_dir      = images_dir
+        self.coco            = COCO(annotations_file)
+        self.image_ids       = image_ids
+        self.cat_mapping     = cat_mapping  # {coco_cat_id -> class_index (1-based)}
+        self.image_size      = image_size
+        self.augment         = augment
 
     def __len__(self):
         return len(self.image_ids)
@@ -181,35 +175,18 @@ class CocoDetectionDataset(Dataset):
         image = Image.open(img_path).convert("RGB")
         orig_w, orig_h = image.size
 
-        # ✅ Resize sans déformation — padding avec noir pour conserver le ratio
-        ratio   = min(self.image_size / orig_w, self.image_size / orig_h)
-        new_w   = int(orig_w * ratio)
-        new_h   = int(orig_h * ratio)
-        image   = image.resize((new_w, new_h), Image.BILINEAR)
+        # Redimensionner
+        image = image.resize((self.image_size, self.image_size))
+        scale_x = self.image_size / orig_w
+        scale_y = self.image_size / orig_h
 
-        # Créer une image carrée avec padding noir
-        canvas  = Image.new("RGB", (self.image_size, self.image_size), (0, 0, 0))
-        pad_x   = (self.image_size - new_w) // 2
-        pad_y   = (self.image_size - new_h) // 2
-        canvas.paste(image, (pad_x, pad_y))
-        image   = canvas
-
-        # Facteurs d'échelle pour ajuster les bounding boxes
-        scale_x = ratio
-        scale_y = ratio
-
-        # Convertir en tensor [C,H,W] dans [0,1]
+        # Convertir en tensor [C, H, W] float32 dans [0, 1]
         image_tensor = TF.to_tensor(image)
 
-        # ✅ Normalisation ImageNet — requise par ResNet-50 pré-entraîné
-        image_tensor = TF.normalize(image_tensor,
-                                    mean=IMAGENET_MEAN,
-                                    std=IMAGENET_STD)
-
         # Annotations
-        anns   = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id))
-        boxes  = []
-        labels = []
+        anns    = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id))
+        boxes   = []
+        labels  = []
 
         for ann in anns:
             if ann.get('iscrowd', 0):
@@ -220,10 +197,10 @@ class CocoDetectionDataset(Dataset):
             x, y, w, h = ann['bbox']
             if w <= 0 or h <= 0:
                 continue
-            x1 = max(0, x * scale_x + pad_x)
-            y1 = max(0, y * scale_y + pad_y)
-            x2 = min(self.image_size, (x + w) * scale_x + pad_x)
-            y2 = min(self.image_size, (y + h) * scale_y + pad_y)
+            x1 = max(0, x * scale_x)
+            y1 = max(0, y * scale_y)
+            x2 = min(self.image_size, (x + w) * scale_x)
+            y2 = min(self.image_size, (y + h) * scale_y)
             if x2 > x1 and y2 > y1:
                 boxes.append([x1, y1, x2, y2])
                 labels.append(class_id)
@@ -245,10 +222,14 @@ def collate_fn(batch):
 # =============================================================================
 
 def build_model(num_classes, pretrained=True):
+    """Construire Faster R-CNN avec backbone ResNet-50 FPN"""
     weights = FasterRCNN_ResNet50_FPN_Weights.DEFAULT if pretrained else None
-    model   = fasterrcnn_resnet50_fpn(weights=weights)
+    model = fasterrcnn_resnet50_fpn(weights=weights)
+
+    # Remplacer la tête de classification
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+
     return model
 
 
@@ -266,73 +247,73 @@ def calculate_iou(box1, box2):
     return inter / denom if denom > 0 else 0
 
 
-def compute_map(predictions, ground_truths, class_names_no_bg, iou_threshold=0.5):
-    """
-    ✅ FIX 2 — mAP = macro-moyenne des AP par classe nommée.
-    Cohérent avec evaluate.py: on itère sur toutes les classes du dataset,
-    pas seulement celles présentes dans le batch de validation.
-    """
-    aps = {}
+def compute_map(predictions, ground_truths, iou_threshold=0.5):
+    """Calculer mAP pour toutes les classes"""
+    all_classes = set()
+    for gt in ground_truths:
+        all_classes.update(gt['labels'].tolist())
 
-    for class_id, name in enumerate(class_names_no_bg, start=1):
+    aps = []
+    for cls in all_classes:
         tps, fps, scores_list = [], [], []
-        n_gt = sum((gt['labels'] == class_id).sum().item() for gt in ground_truths)
-
+        n_gt = sum((gt['labels'] == cls).sum().item() for gt in ground_truths)
         if n_gt == 0:
-            aps[name] = 0.0
             continue
 
         for pred, gt in zip(predictions, ground_truths):
-            mask_p  = pred['labels'] == class_id
-            mask_g  = gt['labels']   == class_id
-            p_boxes  = pred['boxes'][mask_p].cpu().numpy()
-            p_scores = pred['scores'][mask_p].cpu().numpy()
-            g_boxes  = gt['boxes'][mask_g].cpu().numpy()
+            mask_p = pred['labels'] == cls
+            mask_g = gt['labels']  == cls
+            p_boxes = pred['boxes'][mask_p].cpu().numpy()
+            p_scores= pred['scores'][mask_p].cpu().numpy()
+            g_boxes = gt['boxes'][mask_g].cpu().numpy()
 
             matched = set()
             for i in np.argsort(-p_scores):
                 scores_list.append(p_scores[i])
                 if len(g_boxes) == 0:
-                    tps.append(0); fps.append(1); continue
-                ious   = [calculate_iou(p_boxes[i], g) for g in g_boxes]
+                    tps.append(0); fps.append(1)
+                    continue
+                ious = [calculate_iou(p_boxes[i], g) for g in g_boxes]
                 best_j = int(np.argmax(ious))
                 if ious[best_j] >= iou_threshold and best_j not in matched:
-                    matched.add(best_j); tps.append(1); fps.append(0)
+                    matched.add(best_j)
+                    tps.append(1); fps.append(0)
                 else:
                     tps.append(0); fps.append(1)
 
         if not scores_list:
-            aps[name] = 0.0; continue
-
-        order     = np.argsort(-np.array(scores_list))
-        tp_cum    = np.cumsum(np.array(tps)[order])
-        fp_cum    = np.cumsum(np.array(fps)[order])
+            continue
+        order = np.argsort(-np.array(scores_list))
+        tp_cum = np.cumsum(np.array(tps)[order])
+        fp_cum = np.cumsum(np.array(fps)[order])
         precision = tp_cum / (tp_cum + fp_cum + 1e-10)
         recall    = tp_cum / (n_gt + 1e-10)
 
-        ap = sum(np.max(precision[recall >= t]) if (recall >= t).any() else 0
-                 for t in np.arange(0, 1.1, 0.1)) / 11
-        aps[name] = float(ap)
+        # Interpolation 11 points
+        ap = 0
+        for r_thresh in np.arange(0, 1.1, 0.1):
+            mask = recall >= r_thresh
+            ap  += np.max(precision[mask]) if mask.any() else 0
+        aps.append(ap / 11)
 
-    map50 = float(np.mean(list(aps.values()))) if aps else 0.0
-    return map50, aps
+    return float(np.mean(aps)) if aps else 0.0
 
 
 # =============================================================================
 # ENTRAÎNEMENT
 # =============================================================================
 
-def train_one_epoch(model, optimizer, dataloader, device):
+def train_one_epoch(model, optimizer, dataloader, device, epoch, num_epochs):
     model.train()
-    total_loss   = 0
-    losses_dict  = {'loss_classifier': 0, 'loss_box_reg': 0,
-                    'loss_objectness': 0, 'loss_rpn_box_reg': 0}
-    num_batches  = 0
+    total_loss = 0
+    losses_dict = {'loss_classifier': 0, 'loss_box_reg': 0, 'loss_objectness': 0, 'loss_rpn_box_reg': 0}
+    num_batches = 0
 
     for images, targets in dataloader:
         images  = [img.to(device) for img in images]
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
+        # Sauter les batches sans annotations
         if all(len(t['boxes']) == 0 for t in targets):
             continue
 
@@ -354,22 +335,21 @@ def train_one_epoch(model, optimizer, dataloader, device):
             print(f"   ⚠️ Erreur batch: {e}")
             continue
 
-    n = max(num_batches, 1)
-    avg_loss = total_loss / n
+    avg_loss = total_loss / max(num_batches, 1)
     for k in losses_dict:
-        losses_dict[k] /= n
+        losses_dict[k] /= max(num_batches, 1)
 
     return avg_loss, losses_dict
 
 
 @torch.no_grad()
-def evaluate_epoch(model, dataloader, device, class_names_no_bg, score_threshold=0.5):
+def evaluate_epoch(model, dataloader, device, score_threshold=0.5):
     model.eval()
     all_preds = []
     all_gts   = []
 
     for images, targets in dataloader:
-        images  = [img.to(device) for img in images]
+        images = [img.to(device) for img in images]
         outputs = model(images)
 
         for output, target in zip(outputs, targets):
@@ -384,8 +364,8 @@ def evaluate_epoch(model, dataloader, device, class_names_no_bg, score_threshold
                 'labels': target['labels'],
             })
 
-    map50, aps = compute_map(all_preds, all_gts, class_names_no_bg, iou_threshold=0.5)
-    return map50, aps
+    map50 = compute_map(all_preds, all_gts, iou_threshold=0.5)
+    return map50
 
 
 # =============================================================================
@@ -394,8 +374,7 @@ def evaluate_epoch(model, dataloader, device, class_names_no_bg, score_threshold
 
 def train_fasterrcnn():
     CONFIG["classes"] = load_classes(CONFIG["classes_file"])
-    num_classes       = len(CONFIG["classes"])
-    class_names_no_bg = [c for c in CONFIG["classes"] if c != '__background__']
+    num_classes = len(CONFIG["classes"])  # inclut __background__
 
     print("=" * 70)
     print("   Faster R-CNN (ResNet-50 FPN) - Détection des Toitures")
@@ -405,23 +384,23 @@ def train_fasterrcnn():
     print(f"   Annotations: {CONFIG['annotations_file']}")
     print(f"   Classes:     {num_classes} (avec __background__)")
     print(f"   Epochs:      {CONFIG['num_epochs']} | Batch: {CONFIG['batch_size']} | LR: {CONFIG['learning_rate']}")
-    print(f"   Image size:  {CONFIG['image_size']}px")
-    print(f"   ✅ Normalisation ImageNet activée")
-    print(f"   ✅ Resize sans déformation (letterbox padding)")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"   Device:      {device}")
 
     # Répertoire de sortie
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    train_dir = os.path.join("runs", "detect", "train", f"fasterrcnn_{timestamp}")
+    train_dir = os.path.join(CONFIG["output_dir"], f"fasterrcnn_{timestamp}")
     os.makedirs(train_dir, exist_ok=True)
     weights_dir = os.path.join(train_dir, "weights")
     os.makedirs(weights_dir, exist_ok=True)
 
-    # ── Split ─────────────────────────────────────────────────────────────────
-    coco        = COCO(CONFIG["annotations_file"])
-    cat_ids     = coco.getCatIds()
+    # -------------------------------------------------------------------------
+    # Préparer le split
+    # -------------------------------------------------------------------------
+    coco = COCO(CONFIG["annotations_file"])
+    cat_ids = coco.getCatIds()
+    # Mapper: coco_cat_id -> index 1-based (0 est réservé à __background__)
     cat_mapping = {cat_id: idx + 1 for idx, cat_id in enumerate(cat_ids)}
 
     train_ids, val_ids, test_ids, split_stats = stratified_split(
@@ -429,20 +408,20 @@ def train_fasterrcnn():
     )
     print_split_stats(coco, split_stats)
 
-    # ✅ FIX 3 — test_info.json avec chemins absolus et image_size
+    # Sauvegarder les IDs du test set
     test_info = {
-        'test_image_ids':   test_ids,
-        'cat_mapping':      {str(k): v for k, v in cat_mapping.items()},
-        'images_dir':       os.path.abspath(CONFIG["images_dir"]),
-        'annotations_file': os.path.abspath(CONFIG["annotations_file"]),
-        'num_test_images':  len(test_ids),
-        'classes':          CONFIG["classes"],
-        'image_size':       CONFIG["image_size"],
+        'test_image_ids': test_ids,
+        'cat_mapping': {str(k): v for k, v in cat_mapping.items()},
+        'images_dir': CONFIG["images_dir"],
+        'annotations_file': CONFIG["annotations_file"],
+        'num_test_images': len(test_ids),
     }
     with open(os.path.join(train_dir, "test_info.json"), 'w') as f:
         json.dump(test_info, f, indent=2)
 
-    # ── Datasets & DataLoaders ────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    # Datasets & DataLoaders
+    # -------------------------------------------------------------------------
     train_dataset = CocoDetectionDataset(CONFIG["images_dir"], CONFIG["annotations_file"],
                                          train_ids, cat_mapping, CONFIG["image_size"], augment=True)
     val_dataset   = CocoDetectionDataset(CONFIG["images_dir"], CONFIG["annotations_file"],
@@ -453,29 +432,36 @@ def train_fasterrcnn():
     val_loader   = DataLoader(val_dataset,   batch_size=1, shuffle=False,
                               collate_fn=collate_fn, num_workers=0)
 
-    print(f"\n   Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_ids)} images")
+    print(f"\n   Train: {len(train_dataset)} images | Val: {len(val_dataset)} images | Test: {len(test_ids)} images")
 
-    # ── Modèle & Optimiseur ───────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    # Modèle & Optimiseur
+    # -------------------------------------------------------------------------
     print(f"\n🧠 Chargement Faster R-CNN ResNet-50 FPN (pretrained={CONFIG['pretrained']})...")
     model = build_model(num_classes, pretrained=CONFIG["pretrained"])
     model.to(device)
 
-    params       = [p for p in model.parameters() if p.requires_grad]
-    optimizer    = torch.optim.SGD(params, lr=CONFIG["learning_rate"],
-                                   momentum=CONFIG["momentum"],
-                                   weight_decay=CONFIG["weight_decay"])
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(params,
+                                lr=CONFIG["learning_rate"],
+                                momentum=CONFIG["momentum"],
+                                weight_decay=CONFIG["weight_decay"])
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
 
-    # ── Boucle d'entraînement ─────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    # Boucle d'entraînement
+    # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
     print(f"   🚀 ENTRAÎNEMENT - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 70)
 
     history = {
-        'train_loss': [], 'val_map50': [], 'val_ap_per_class': [],
+        'train_loss': [], 'val_map50': [],
         'loss_classifier': [], 'loss_box_reg': [],
-        'loss_objectness': [], 'loss_rpn_box_reg': [], 'lr': [],
+        'loss_objectness': [], 'loss_rpn_box_reg': [],
+        'lr': [],
     }
+
     best_map50 = 0.0
     start_time = time.time()
 
@@ -483,15 +469,13 @@ def train_fasterrcnn():
         epoch_start = time.time()
         print(f"\n📅 Epoch [{epoch}/{CONFIG['num_epochs']}]")
 
-        avg_loss, losses_dict    = train_one_epoch(model, optimizer, train_loader, device)
-        val_map50, val_aps       = evaluate_epoch(model, val_loader, device,
-                                                  class_names_no_bg, CONFIG["score_threshold"])
+        avg_loss, losses_dict = train_one_epoch(model, optimizer, train_loader, device, epoch, CONFIG["num_epochs"])
+        val_map50 = evaluate_epoch(model, val_loader, device, CONFIG["score_threshold"])
         lr_scheduler.step()
 
         current_lr = optimizer.param_groups[0]['lr']
         history['train_loss'].append(avg_loss)
         history['val_map50'].append(val_map50)
-        history['val_ap_per_class'].append(val_aps)
         history['loss_classifier'].append(losses_dict['loss_classifier'])
         history['loss_box_reg'].append(losses_dict['loss_box_reg'])
         history['loss_objectness'].append(losses_dict['loss_objectness'])
@@ -500,95 +484,96 @@ def train_fasterrcnn():
 
         epoch_time = time.time() - epoch_start
         print(f"   Loss: {avg_loss:.4f} | mAP@50: {val_map50:.4f} | LR: {current_lr:.6f} | ⏱️ {format_time(epoch_time)}")
-        for name, ap in val_aps.items():
-            print(f"      {name:<30} AP={ap:.3f}")
 
+        # Sauvegarder le meilleur modèle
         if val_map50 > best_map50:
             best_map50 = val_map50
             torch.save({
-                'epoch':                epoch,
-                'model_state_dict':     model.state_dict(),
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'map50':                best_map50,
-                'num_classes':          num_classes,
-                'classes':              CONFIG["classes"],
-                'cat_mapping':          cat_mapping,
-                'image_size':           CONFIG["image_size"],
+                'map50': best_map50,
+                'num_classes': num_classes,
+                'classes': CONFIG["classes"],
+                'cat_mapping': cat_mapping,
             }, os.path.join(weights_dir, "best.pth"))
             print(f"   💾 Meilleur modèle sauvegardé (mAP@50: {best_map50:.4f})")
 
+        # Sauvegarde périodique
         if epoch % CONFIG["save_every"] == 0 or epoch == CONFIG["num_epochs"]:
             torch.save({
-                'epoch':                epoch,
-                'model_state_dict':     model.state_dict(),
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'map50':                val_map50,
-                'num_classes':          num_classes,
-                'classes':              CONFIG["classes"],
-                'cat_mapping':          cat_mapping,
-                'image_size':           CONFIG["image_size"],
+                'map50': val_map50,
+                'num_classes': num_classes,
+                'classes': CONFIG["classes"],
+                'cat_mapping': cat_mapping,
             }, os.path.join(weights_dir, "last.pth"))
 
     total_time = time.time() - start_time
 
-    # ── Copier les modèles ────────────────────────────────────────────────────
-    print("\n📦 Copie des modèles...")
+    # -------------------------------------------------------------------------
+    # Copier les modèles
+    # -------------------------------------------------------------------------
     for src, dst in [("best.pth", "best_model.pth"), ("last.pth", "final_model.pth")]:
         src_path = os.path.join(weights_dir, src)
         dst_path = os.path.join(train_dir, dst)
         if os.path.exists(src_path):
             shutil.copy2(src_path, dst_path)
-            print(f"   ✅ {dst} ({os.path.getsize(dst_path)/1024/1024:.1f} MB)")
+            print(f"   ✅ {dst} ({os.path.getsize(dst_path) / 1024 / 1024:.1f} MB)")
 
-    # ── Historique ────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    # Sauvegarder l'historique
+    # -------------------------------------------------------------------------
     history['time_stats'] = {
-        'total_time':               total_time,
-        'total_time_formatted':     format_time(total_time),
+        'total_time': total_time,
+        'total_time_formatted': format_time(total_time),
         'avg_epoch_time_formatted': format_time(total_time / CONFIG["num_epochs"]),
     }
-    history['config']     = CONFIG
+    history['config'] = CONFIG
     history['best_map50'] = best_map50
 
     with open(os.path.join(train_dir, "history.json"), 'w') as f:
         json.dump(history, f, indent=2, default=str)
 
-    # ── Graphiques ────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    # Graphiques
+    # -------------------------------------------------------------------------
     epochs = range(1, len(history['train_loss']) + 1)
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
-    axes[0, 0].plot(epochs, history['train_loss'], 'b-')
-    axes[0, 0].set_title('Loss totale'); axes[0, 0].grid(True, alpha=0.3)
+    axes[0, 0].plot(epochs, history['train_loss'], 'b-', label='Train Loss')
+    axes[0, 0].set_title('Loss totale'); axes[0, 0].legend(); axes[0, 0].grid(True, alpha=0.3)
 
-    axes[0, 1].plot(epochs, history['val_map50'], 'g-')
-    axes[0, 1].set_title('mAP@50 (Validation — macro-moyenne)')
-    axes[0, 1].set_ylim(0, 1); axes[0, 1].grid(True, alpha=0.3)
+    axes[0, 1].plot(epochs, history['val_map50'], 'g-', label='mAP@50')
+    axes[0, 1].set_title('mAP@50 (Validation)'); axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3); axes[0, 1].set_ylim(0, 1)
 
     axes[1, 0].plot(epochs, history['loss_classifier'], label='Classifier')
     axes[1, 0].plot(epochs, history['loss_box_reg'],    label='Box Reg')
-    axes[1, 0].set_title('Losses classification & box')
-    axes[1, 0].legend(); axes[1, 0].grid(True, alpha=0.3)
+    axes[1, 0].set_title('Losses classification & box'); axes[1, 0].legend(); axes[1, 0].grid(True, alpha=0.3)
 
-    axes[1, 1].plot(epochs, history['loss_objectness'],  label='Objectness')
-    axes[1, 1].plot(epochs, history['loss_rpn_box_reg'], label='RPN Box Reg')
-    axes[1, 1].set_title('Losses RPN')
-    axes[1, 1].legend(); axes[1, 1].grid(True, alpha=0.3)
+    axes[1, 1].plot(epochs, history['loss_objectness'],   label='Objectness')
+    axes[1, 1].plot(epochs, history['loss_rpn_box_reg'],  label='RPN Box Reg')
+    axes[1, 1].set_title('Losses RPN'); axes[1, 1].legend(); axes[1, 1].grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(os.path.join(train_dir, 'training_curves.png'), dpi=150)
     plt.close()
 
-    # ── Rapport ───────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    # Rapport texte
+    # -------------------------------------------------------------------------
     with open(os.path.join(train_dir, "training_report.txt"), 'w', encoding='utf-8') as f:
         f.write("Faster R-CNN (ResNet-50 FPN) - Rapport\n")
         f.write("=" * 50 + "\n\n")
-        f.write(f"Dataset:        {CONFIG['images_dir']}\n")
-        f.write(f"Classes:        {CONFIG['classes']}\n")
-        f.write(f"Epochs:         {CONFIG['num_epochs']} | Batch: {CONFIG['batch_size']}\n")
-        f.write(f"Normalisation:  ImageNet (mean={IMAGENET_MEAN}, std={IMAGENET_STD})\n")
-        f.write(f"Resize:         Letterbox sans déformation\n\n")
-        f.write(f"Meilleur mAP@50: {best_map50:.4f} ({best_map50*100:.2f}%)\n")
-        f.write(f"Temps total:     {format_time(total_time)}\n")
-        f.write(f"Chemin:          {train_dir}\n")
+        f.write(f"Dataset: {CONFIG['images_dir']}\n")
+        f.write(f"Classes: {CONFIG['classes']}\n")
+        f.write(f"Epochs: {CONFIG['num_epochs']} | Batch: {CONFIG['batch_size']}\n\n")
+        f.write(f"Meilleur mAP@50: {best_map50:.4f}\n")
+        f.write(f"Temps total: {format_time(total_time)}\n")
+        f.write(f"Chemin: {train_dir}\n")
 
     print("\n" + "=" * 70)
     print("   🎉 TERMINÉ")

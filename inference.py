@@ -41,6 +41,7 @@ def load_classes(yaml_path="classes.yaml"):
         classes = ['__background__'] + classes
     return classes
 
+
 def load_colors(yaml_path="classes.yaml"):
     default = {
         'panneau_solaire':    (255, 0,   0),
@@ -54,12 +55,11 @@ def load_colors(yaml_path="classes.yaml"):
         colors = yaml.safe_load(f).get('colors', {})
     return {k: tuple(v) for k, v in colors.items()} if colors else default
 
+
 CLASSES_FILE = os.getenv("CLASSES_FILE", "classes.yaml")
 CLASSES      = load_classes(CLASSES_FILE)
 COLORS       = load_colors(CLASSES_FILE)
 
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD  = [0.229, 0.224, 0.225]
 
 def format_time(seconds):
     return f"{seconds*1000:.1f} ms" if seconds < 1 else f"{seconds:.2f} s"
@@ -74,6 +74,7 @@ def build_model(num_classes):
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
     return model
+
 
 def find_best_model():
     """Trouver automatiquement le meilleur modèle"""
@@ -102,12 +103,15 @@ def find_best_model():
                 found = os.path.join(root, fname)
                 print(f"📁 Modèle trouvé: {found}")
                 return found
+
     return None
+
 
 def load_model(model_path, device):
     checkpoint  = torch.load(model_path, map_location=device)
     num_classes = checkpoint.get('num_classes', len(CLASSES))
     classes     = checkpoint.get('classes', CLASSES)
+
     model = build_model(num_classes)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
@@ -123,90 +127,104 @@ def load_model(model_path, device):
 def predict(model, image_path, classes, device, threshold=0.5, image_size=640):
     image = Image.open(image_path).convert("RGB")
     orig_w, orig_h = image.size
+    resized = image.resize((image_size, image_size))
+    tensor  = TF.to_tensor(resized).unsqueeze(0).to(device)
 
-    # ✅ Fix 1 — Letterbox resize (cohérent avec train.py)
-    ratio        = min(image_size / orig_w, image_size / orig_h)
-    new_w, new_h = int(orig_w * ratio), int(orig_h * ratio)
-    resized      = image.resize((new_w, new_h), Image.BILINEAR)
-    canvas       = Image.new("RGB", (image_size, image_size), (0, 0, 0))
-    pad_x        = (image_size - new_w) // 2
-    pad_y        = (image_size - new_h) // 2
-    canvas.paste(resized, (pad_x, pad_y))
+    scale_x = orig_w / image_size
+    scale_y = orig_h / image_size
 
-    # ✅ Fix 2 — Normalisation ImageNet (cohérente avec train.py)
-    tensor = TF.to_tensor(canvas)
-    tensor = TF.normalize(tensor, mean=IMAGENET_MEAN, std=IMAGENET_STD)
-    tensor = tensor.unsqueeze(0).to(device)
-
-    start    = time.time()
-    outputs  = model(tensor)
+    start   = time.time()
+    outputs = model(tensor)
     inf_time = time.time() - start
 
     output = outputs[0]
     keep   = output['scores'] >= threshold
+
     boxes  = output['boxes'][keep].cpu().numpy()
     labels = output['labels'][keep].cpu().numpy()
     scores = output['scores'][keep].cpu().numpy()
 
-    # ✅ Fix 3 — Rescaling boxes : annuler letterbox pour revenir aux coords originales
-    if len(boxes) > 0:
-        boxes[:, 0] = (boxes[:, 0] - pad_x) / ratio   # x1
-        boxes[:, 1] = (boxes[:, 1] - pad_y) / ratio   # y1
-        boxes[:, 2] = (boxes[:, 2] - pad_x) / ratio   # x2
-        boxes[:, 3] = (boxes[:, 3] - pad_y) / ratio   # y2
-        # Clamp dans les dimensions originales
-        boxes[:, 0] = boxes[:, 0].clip(0, orig_w)
-        boxes[:, 1] = boxes[:, 1].clip(0, orig_h)
-        boxes[:, 2] = boxes[:, 2].clip(0, orig_w)
-        boxes[:, 3] = boxes[:, 3].clip(0, orig_h)
+    # Rescaler les boxes vers les dimensions originales
+    boxes[:, 0] *= scale_x; boxes[:, 2] *= scale_x
+    boxes[:, 1] *= scale_y; boxes[:, 3] *= scale_y
 
     class_names = [classes[int(l)] if int(l) < len(classes) else 'unknown' for l in labels]
-    return image, {'boxes': boxes, 'labels': labels, 'scores': scores,
-                   'class_names': class_names, 'inference_time': inf_time}
+
+    preds = {
+        'boxes':          boxes,
+        'labels':         labels,
+        'scores':         scores,
+        'class_names':    class_names,
+        'inference_time': inf_time,
+    }
+    return image, preds
+
 
 def visualize(image, preds, output_path=None, show=True):
     fig, axes = plt.subplots(1, 2, figsize=(16, 8))
     axes[0].imshow(image); axes[0].set_title("Original"); axes[0].axis('off')
     axes[1].imshow(image)
+
     for box, class_name, score in zip(preds['boxes'], preds['class_names'], preds['scores']):
         color = [c / 255 for c in COLORS.get(class_name, (128, 128, 128))]
         x1, y1, x2, y2 = box
-        axes[1].add_patch(patches.Rectangle((x1, y1), x2-x1, y2-y1,
-            linewidth=2, edgecolor=color, facecolor='none'))
-        axes[1].text(x1, y1-5, f"{class_name}\n{score:.2f}", fontsize=8, color='white',
+        axes[1].add_patch(patches.Rectangle(
+            (x1, y1), x2 - x1, y2 - y1,
+            linewidth=2, edgecolor=color, facecolor='none'
+        ))
+        axes[1].text(x1, y1 - 5, f"{class_name}\n{score:.2f}", fontsize=8, color='white',
                      bbox=dict(boxstyle='round', facecolor=color, alpha=0.8))
-    axes[1].set_title(f"Faster R-CNN: {len(preds['boxes'])} objets | {format_time(preds['inference_time'])}")
+
+    axes[1].set_title(f"Faster R-CNN: {len(preds['boxes'])} objets | ⏱️ {format_time(preds['inference_time'])}")
     axes[1].axis('off')
-    legend = [patches.Patch(facecolor=[c/255 for c in col], label=name) for name, col in COLORS.items()]
+
+    legend = [patches.Patch(facecolor=[c / 255 for c in col], label=name) for name, col in COLORS.items()]
     fig.legend(handles=legend, loc='lower center', ncol=4)
-    plt.tight_layout(); plt.subplots_adjust(bottom=0.1)
-    if output_path: plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    if show: plt.show()
+
+    plt.tight_layout()
+    plt.subplots_adjust(bottom=0.1)
+
+    if output_path:
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    if show:
+        plt.show()
     plt.close()
+
 
 def generate_report(preds, image_name, classes):
     class_names_no_bg = [c for c in classes if c != '__background__']
-    report = {'image': image_name, 'model': 'Faster R-CNN',
-               'timestamp': datetime.now().isoformat(),
-               'inference_time_ms': preds['inference_time'] * 1000,
-               'total_objects': len(preds['boxes']),
-               'by_class': {c: {'count': 0} for c in class_names_no_bg},
-               'detections': []}
+    report = {
+        'image':            image_name,
+        'model':            'Faster R-CNN',
+        'timestamp':        datetime.now().isoformat(),
+        'inference_time_ms': preds['inference_time'] * 1000,
+        'total_objects':    len(preds['boxes']),
+        'by_class':         {c: {'count': 0} for c in class_names_no_bg},
+        'detections':       [],
+    }
     for i, (box, class_name, score) in enumerate(zip(preds['boxes'], preds['class_names'], preds['scores'])):
         if class_name in report['by_class']:
             report['by_class'][class_name]['count'] += 1
-        report['detections'].append({'id': i, 'class': class_name,
-            'confidence': float(score), 'bbox': box.tolist()})
+        report['detections'].append({
+            'id': i, 'class': class_name,
+            'confidence': float(score),
+            'bbox': box.tolist()
+        })
     return report
+
 
 def generate_summary(reports, output_dir, total_time, classes):
     class_names_no_bg = [c for c in classes if c != '__background__']
-    summary = {'model': 'Faster R-CNN', 'timestamp': datetime.now().isoformat(),
-                'total_images': len(reports), 'total_time_s': total_time,
-                'avg_inference_ms': sum(r['inference_time_ms'] for r in reports)/len(reports) if reports else 0,
-                'total_objects': sum(r['total_objects'] for r in reports),
-                'by_class': {c: sum(r['by_class'].get(c,{}).get('count',0) for r in reports) for c in class_names_no_bg},
-                'per_image': [{'image': r['image'], 'objects': r['total_objects'], 'time_ms': r['inference_time_ms']} for r in reports]}
+    summary = {
+        'model':            'Faster R-CNN',
+        'timestamp':        datetime.now().isoformat(),
+        'total_images':     len(reports),
+        'total_time_s':     total_time,
+        'avg_inference_ms': sum(r['inference_time_ms'] for r in reports) / len(reports) if reports else 0,
+        'total_objects':    sum(r['total_objects'] for r in reports),
+        'by_class':         {c: sum(r['by_class'].get(c, {}).get('count', 0) for r in reports) for c in class_names_no_bg},
+        'per_image':        [{'image': r['image'], 'objects': r['total_objects'], 'time_ms': r['inference_time_ms']} for r in reports],
+    }
     with open(os.path.join(output_dir, 'summary.json'), 'w') as f:
         json.dump(summary, f, indent=2)
     with open(os.path.join(output_dir, 'summary.txt'), 'w', encoding='utf-8') as f:
@@ -222,27 +240,41 @@ def generate_summary(reports, output_dir, total_time, classes):
 
 def main():
     parser = argparse.ArgumentParser(description="Inférence Faster R-CNN")
-    parser.add_argument("--model",       default=None)
+    parser.add_argument("--model",       default=None,    help="Chemin du modèle .pth (auto-détecté si absent)")
     parser.add_argument("--input",       default=os.getenv("DETECTION_INFERENCE_IMAGES_DIR", "../test"))
     parser.add_argument("--output",      default=os.getenv("PREDICTIONS_DIR", "./predictions"))
     parser.add_argument("--threshold",   type=float, default=float(os.getenv("SCORE_THRESHOLD", "0.5")))
     parser.add_argument("--image-size",  type=int,   default=int(os.getenv("IMAGE_SIZE", "640")))
     parser.add_argument("--no-display",  action="store_true")
     args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"   Device: {device}")
+
+    # Trouver le modèle
     if args.model is None:
         args.model = find_best_model()
     if args.model is None or not os.path.exists(args.model):
-        print(f"❌ Modèle non trouvé: {args.model}"); return
+        print(f"❌ Modèle non trouvé: {args.model}")
+        return
+
     model, classes = load_model(args.model, device)
     print(f"🧠 Modèle: {args.model} | Classes: {classes}")
+
     os.makedirs(args.output, exist_ok=True)
+
     input_path = Path(args.input)
-    images = sorted([p for p in input_path.iterdir()
-                     if p.suffix.lower() in {'.jpg','.jpeg','.png','.tif','.tiff'}]) if input_path.is_dir() else [input_path]
+    if input_path.is_dir():
+        images = sorted([p for p in input_path.iterdir()
+                         if p.suffix.lower() in {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}])
+    else:
+        images = [input_path]
+
     print(f"🖼️  {len(images)} image(s)\n")
-    reports = []; start_total = time.time()
+
+    reports    = []
+    start_total = time.time()
+
     for idx, img_path in enumerate(images, 1):
         print(f"[{idx}/{len(images)}] 🔍 {img_path.name}")
         image, preds = predict(model, str(img_path), classes, device, args.threshold, args.image_size)
@@ -251,12 +283,16 @@ def main():
         report = generate_report(preds, img_path.name, classes)
         reports.append(report)
         print(f"   ✅ {report['total_objects']} objets | ⏱️ {report['inference_time_ms']:.1f} ms")
+
     with open(os.path.join(args.output, 'reports.json'), 'w') as f:
         json.dump(reports, f, indent=2)
+
     if len(images) > 1:
-        summary = generate_summary(reports, args.output, time.time()-start_total, classes)
+        summary = generate_summary(reports, args.output, time.time() - start_total, classes)
         print(f"\n📊 Résumé: {summary['total_objects']} objets | {summary['avg_inference_ms']:.1f} ms/image")
+
     print(f"\n📁 Résultats: {args.output}")
+
 
 if __name__ == "__main__":
     main()
