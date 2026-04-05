@@ -4,28 +4,31 @@ Dataset: Images aériennes annotées avec CVAT (format COCO)
 Classes: Chargées depuis classes.yaml
 Configuration: Chargée depuis .env
 
-CORRECTIONS:
-  1. score_threshold = 0.3 (classes minoritaires ont des scores bas)
-  2. Augmentation ciblée classes rares (batiment_peint, batiment_enduit)
-  3. compute_map() macro-moyenne par classe
-  4. test_info.json chemins absolus + image_size
+NOUVEAUTÉS :
+  - Augmentation différentielle (classes rares sur-représentées)
+  - WeightedRandomSampler : batiment_peint ×3, batiment_non_enduit ×2, batiment_enduit ×1.5
+  - Augmentations géométriques : flip H/V, rotation 90°, RandomResizedCrop
+  - Augmentations photométriques : ColorJitter, GaussianBlur, bruit additif, gris aléatoire
+  - CutOut ciblé sur les images contenant des classes rares
 """
 
 import os
 import json
 import yaml
 import shutil
+import random
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 import matplotlib.pyplot as plt
 from datetime import datetime
 import time
+import gc
 import torch
 import torchvision
 from torchvision.models.detection import fasterrcnn_resnet50_fpn, FasterRCNN_ResNet50_FPN_Weights
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 import torchvision.transforms.functional as TF
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from pycocotools.coco import COCO
 import warnings
 warnings.filterwarnings('ignore')
@@ -66,6 +69,7 @@ CONFIG = {
     "classes_file":      os.getenv("CLASSES_FILE", "classes.yaml"),
     "classes":           None,
 
+    # Hyperparamètres
     "num_epochs":        int(os.getenv("NUM_EPOCHS", "25")),
     "batch_size":        int(os.getenv("BATCH_SIZE", "2")),
     "learning_rate":     float(os.getenv("LEARNING_RATE", "0.005")),
@@ -76,12 +80,19 @@ CONFIG = {
     "val_split":         float(os.getenv("VAL_SPLIT", "0.20")),
     "test_split":        float(os.getenv("TEST_SPLIT", "0.10")),
     "save_every":        int(os.getenv("SAVE_EVERY", "5")),
-    "score_threshold":   float(os.getenv("SCORE_THRESHOLD", "0.3")),
+    "score_threshold":   float(os.getenv("SCORE_THRESHOLD", "0.5")),
     "pretrained":        os.getenv("PRETRAINED", "true").lower() == "true",
-}
 
-# Classes minoritaires — augmentation plus agressive
-RARE_CLASSES = {'batiment_peint', 'batiment_enduit'}
+    # Poids de sur-échantillonnage par classe (1-based index)
+    # Augmenté si l'image contient au moins une instance de cette classe.
+    # Quand une image contient plusieurs classes rares, on prend le max.
+    "rare_class_weights": {
+        "batiment_peint":      3.0,
+        "batiment_non_enduit": 2.0,
+        "batiment_enduit":     1.5,
+        # panneau_solaire reste à 1.0 (classe dominante)
+    },
+}
 
 
 # =============================================================================
@@ -122,9 +133,8 @@ def stratified_split(coco, train_split, val_split, test_split, seed=42):
 
     stats = {'train': {}, 'val': {}, 'test': {}}
     for cat_id in coco.getCatIds():
-        stats['train'][cat_id] = 0
-        stats['val'][cat_id]   = 0
-        stats['test'][cat_id]  = 0
+        for split in stats:
+            stats[split][cat_id] = 0
 
     for img_id in train_ids:
         for ann in coco.loadAnns(coco.getAnnIds(imgIds=img_id)):
@@ -155,27 +165,214 @@ def print_split_stats(coco, stats):
 
 
 # =============================================================================
+# AUGMENTATIONS
+# =============================================================================
+
+def apply_cutout(image_tensor, boxes, n_holes=1, max_size=32, min_size=16):
+    """
+    CutOut : masque aléatoire sur l'image (ne touche pas les boxes GT).
+    Fonctionne sur tensor [C, H, W] dans [0, 1].
+    """
+    c, h, w = image_tensor.shape
+    result = image_tensor.clone()
+    for _ in range(n_holes):
+        hole_h = random.randint(min_size, max_size)
+        hole_w = random.randint(min_size, max_size)
+        y = random.randint(0, h - hole_h)
+        x = random.randint(0, w - hole_w)
+        result[:, y:y + hole_h, x:x + hole_w] = 0.0
+    return result
+
+
+def augment_image_and_boxes(image: Image.Image, boxes: list, labels: list,
+                             image_size: int, is_rare: bool):
+    """
+    Applique des augmentations à une image PIL et met à jour les boxes.
+
+    Paramètres
+    ----------
+    image      : PIL.Image RGB, déjà resizée à (image_size × image_size)
+    boxes      : list de [x1, y1, x2, y2] en pixels (image_size coords)
+    labels     : list de int
+    image_size : taille de l'image (carré)
+    is_rare    : True si l'image contient au moins une classe rare
+
+    Retourne
+    --------
+    image_tensor : torch.Tensor [C, H, W]
+    boxes_out    : list de [x1, y1, x2, y2]
+    labels_out   : list de int (identiques, pas de filtrage)
+    """
+    W = H = image_size
+
+    # --- Flip horizontal ---
+    if random.random() < 0.5:
+        image = TF.hflip(image)
+        boxes = [[W - x2, y1, W - x1, y2] for x1, y1, x2, y2 in boxes]
+
+    # --- Flip vertical ---
+    if random.random() < 0.5:
+        image = TF.vflip(image)
+        boxes = [[x1, H - y2, x2, H - y1] for x1, y1, x2, y2 in boxes]
+
+    # --- Rotation 90° (multiple de 90) ---
+    if random.random() < 0.3:
+        k = random.choice([1, 2, 3])   # 90, 180, 270 degrés
+        image = image.rotate(-90 * k, expand=False)
+        new_boxes = []
+        for x1, y1, x2, y2 in boxes:
+            for _ in range(k):
+                x1, y1, x2, y2 = y1, W - x2, y2, W - x1
+            new_boxes.append([
+                max(0, min(x1, x2)), max(0, min(y1, y2)),
+                min(W, max(x1, x2)), min(H, max(y1, y2))
+            ])
+        boxes = new_boxes
+
+    # --- RandomResizedCrop : recadrage aléatoire + resize ---
+    # Utilisé seulement si on a des boxes (sinon risque de crop vide)
+    if random.random() < 0.4 and len(boxes) > 0:
+        scale = random.uniform(0.65, 1.0)
+        crop_size = int(W * scale)
+        max_x = W - crop_size
+        max_y = H - crop_size
+        cx = random.randint(0, max_x)
+        cy = random.randint(0, max_y)
+
+        image = image.crop((cx, cy, cx + crop_size, cy + crop_size))
+        image = image.resize((W, H), Image.BILINEAR)
+
+        ratio = W / crop_size
+        new_boxes = []
+        new_labels = []
+        for (x1, y1, x2, y2), lbl in zip(boxes, labels):
+            # Recalculer dans le crop
+            nx1 = max(0, (x1 - cx) * ratio)
+            ny1 = max(0, (y1 - cy) * ratio)
+            nx2 = min(W, (x2 - cx) * ratio)
+            ny2 = min(H, (y2 - cy) * ratio)
+            # Garder si la box résultante est assez grande (>= 8px de côté)
+            if nx2 - nx1 >= 8 and ny2 - ny1 >= 8:
+                new_boxes.append([nx1, ny1, nx2, ny2])
+                new_labels.append(lbl)
+        # Si toutes les boxes ont disparu du crop, on abandonne ce crop
+        if len(new_boxes) > 0:
+            boxes  = new_boxes
+            labels = new_labels
+        else:
+            # Revenir à l'image resizée sans crop
+            image = image.resize((W, H), Image.BILINEAR)
+
+    # --- Augmentations photométriques (sur PIL avant conversion tensor) ---
+
+    # ColorJitter : luminosité, contraste, saturation, teinte
+    if random.random() < 0.7:
+        brightness = random.uniform(0.6, 1.4)
+        contrast   = random.uniform(0.7, 1.3)
+        saturation = random.uniform(0.7, 1.3)
+        hue        = random.uniform(-0.05, 0.05)
+        image = TF.adjust_brightness(image, brightness)
+        image = TF.adjust_contrast(image, contrast)
+        image = TF.adjust_saturation(image, saturation)
+        image = TF.adjust_hue(image, hue)
+
+    # Gris aléatoire (simule images IR ou overcast)
+    if random.random() < 0.1:
+        image = TF.to_grayscale(image, num_output_channels=3)
+
+    # Conversion en tensor
+    tensor = TF.to_tensor(image)   # [C, H, W], float32 dans [0, 1]
+
+    # Flou gaussien (après conversion pour garder la précision)
+    if random.random() < 0.3:
+        kernel_size = random.choice([3, 5])
+        sigma = random.uniform(0.5, 1.5)
+        tensor = TF.gaussian_blur(tensor, kernel_size=[kernel_size, kernel_size], sigma=sigma)
+
+    # Bruit gaussien additif
+    if random.random() < 0.2:
+        noise = torch.randn_like(tensor) * random.uniform(0.01, 0.04)
+        tensor = (tensor + noise).clamp(0.0, 1.0)
+
+    # CutOut — priorité aux images de classes rares
+    cutout_prob = 0.5 if is_rare else 0.15
+    if random.random() < cutout_prob and len(boxes) > 0:
+        tensor = apply_cutout(tensor, boxes, n_holes=random.randint(1, 2),
+                              max_size=32, min_size=16)
+
+    return tensor, boxes, labels
+
+
+# =============================================================================
+# CALCUL DES POIDS DE SAMPLER
+# =============================================================================
+
+def compute_sample_weights(coco, image_ids, cat_mapping, rare_class_weights, classes):
+    """
+    Calcule un poids par image pour WeightedRandomSampler.
+    Le poids d'une image est le maximum des poids de ses classes présentes.
+    """
+    # Construire un mapping name -> weight
+    # classes est ['__background__', 'cls1', ...]
+    name_to_weight = {name: rare_class_weights.get(name, 1.0) for name in classes}
+
+    # Mapping cat_id COCO -> nom de classe
+    cat_id_to_name = {cat_id: coco.cats[cat_id]['name'] for cat_id in coco.getCatIds()}
+
+    weights = []
+    rare_count = 0
+
+    for img_id in image_ids:
+        anns = coco.loadAnns(coco.getAnnIds(imgIds=img_id))
+        img_weight = 1.0
+        for ann in anns:
+            cat_name = cat_id_to_name.get(ann['category_id'], '')
+            w = name_to_weight.get(cat_name, 1.0)
+            if w > img_weight:
+                img_weight = w
+        if img_weight > 1.0:
+            rare_count += 1
+        weights.append(img_weight)
+
+    print(f"   🎲 Sampler: {rare_count}/{len(image_ids)} images avec classes rares sur-pondérées")
+    for name, w in rare_class_weights.items():
+        print(f"      {name:<30} ×{w:.1f}")
+
+    return weights
+
+
+# =============================================================================
 # DATASET PYTORCH
 # =============================================================================
 
 class CocoDetectionDataset(Dataset):
-    """Dataset COCO pour Faster R-CNN avec augmentation ciblée classes rares"""
+    """Dataset COCO pour Faster R-CNN avec augmentation différentielle."""
 
-    def __init__(self, images_dir, annotations_file, image_ids,
-                 cat_mapping, image_size=640, augment=False):
-        self.images_dir  = images_dir
-        self.coco        = COCO(annotations_file)
-        self.image_ids   = image_ids
-        self.cat_mapping = cat_mapping
-        self.image_size  = image_size
-        self.augment     = augment
+    def __init__(self, images_dir, annotations_file, image_ids, cat_mapping,
+                 image_size=640, augment=False, rare_class_names=None):
+        self.images_dir       = images_dir
+        self.coco             = COCO(annotations_file)
+        self.image_ids        = image_ids
+        self.cat_mapping      = cat_mapping
+        self.image_size       = image_size
+        self.augment          = augment
+        self.rare_class_names = set(rare_class_names or [])
+
+        # Pré-calculer quelles images contiennent des classes rares
+        self._rare_flags = {}
+        if augment and self.rare_class_names:
+            cat_id_to_name = {cat_id: self.coco.cats[cat_id]['name']
+                              for cat_id in self.coco.getCatIds()}
+            for img_id in image_ids:
+                anns = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id))
+                is_rare = any(cat_id_to_name.get(a['category_id'], '') in self.rare_class_names
+                              for a in anns)
+                self._rare_flags[img_id] = is_rare
 
     def __len__(self):
         return len(self.image_ids)
 
     def __getitem__(self, idx):
-        import random as _rnd
-
         img_id   = self.image_ids[idx]
         img_info = self.coco.imgs[img_id]
         img_path = os.path.join(self.images_dir, img_info['file_name'])
@@ -183,45 +380,13 @@ class CocoDetectionDataset(Dataset):
         image = Image.open(img_path).convert("RGB")
         orig_w, orig_h = image.size
 
-        # Redimensionner
-        image   = TF.resize(image, self.image_size)
-        scale_x = self.image_size / orig_w
-        scale_y = self.image_size / orig_h
+        # Redimensionner à image_size × image_size
+        image    = image.resize((self.image_size, self.image_size), Image.BILINEAR)
+        scale_x  = self.image_size / orig_w
+        scale_y  = self.image_size / orig_h
 
-        # Détecter si l'image contient des classes rares
-        anns_check = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id))
-        cat_names_in_image = {
-            self.coco.cats[a['category_id']]['name']
-            for a in anns_check if not a.get('iscrowd', 0)
-        }
-        has_rare = bool(cat_names_in_image & RARE_CLASSES)
-
-        # Augmentation ciblée — plus agressive si classe rare
-        do_hflip = do_vflip = False
-        if self.augment:
-            # Flip horizontal — toutes les images 50%
-            do_hflip = _rnd.random() > 0.5
-            # Flip vertical — 50% si rare, 15% sinon
-            do_vflip = _rnd.random() > (0.5 if has_rare else 0.85)
-
-            if do_hflip: image = TF.hflip(image)
-            if do_vflip: image = TF.vflip(image)
-
-            # Colorjitter — ±30% si rare, ±15% sinon
-            j = 0.30 if has_rare else 0.15
-            image = TF.adjust_brightness(image, 1.0 + _rnd.uniform(-j, j))
-            image = TF.adjust_contrast(image,   1.0 + _rnd.uniform(-j, j))
-            image = TF.adjust_saturation(image, 1.0 + _rnd.uniform(-j, j))
-
-            # Rotation ±15° — seulement si rare
-            if has_rare and _rnd.random() > 0.5:
-                image = TF.rotate(image, _rnd.uniform(-15, 15), fill=0)
-
-        # Convertir en tensor
-        image_tensor = TF.to_tensor(image)
-
-        # Annotations
-        anns   = anns_check
+        # Charger les annotations et adapter les boxes
+        anns   = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id))
         boxes  = []
         labels = []
 
@@ -239,11 +404,17 @@ class CocoDetectionDataset(Dataset):
             x2 = min(self.image_size, (x + w) * scale_x)
             y2 = min(self.image_size, (y + h) * scale_y)
             if x2 > x1 and y2 > y1:
-                if do_hflip: x1, x2 = self.image_size - x2, self.image_size - x1
-                if do_vflip: y1, y2 = self.image_size - y2, self.image_size - y1
-                if x2 > x1 and y2 > y1:
-                    boxes.append([x1, y1, x2, y2])
-                    labels.append(class_id)
+                boxes.append([x1, y1, x2, y2])
+                labels.append(class_id)
+
+        # --- Augmentation ---
+        if self.augment and len(boxes) > 0:
+            is_rare = self._rare_flags.get(img_id, False)
+            image_tensor, boxes, labels = augment_image_and_boxes(
+                image, boxes, labels, self.image_size, is_rare
+            )
+        else:
+            image_tensor = TF.to_tensor(image)
 
         target = {
             'boxes':    torch.tensor(boxes,  dtype=torch.float32) if boxes  else torch.zeros((0, 4), dtype=torch.float32),
@@ -283,89 +454,109 @@ def calculate_iou(box1, box2):
     return inter / denom if denom > 0 else 0
 
 
-def compute_map(predictions, ground_truths, class_names_no_bg, iou_threshold=0.5):
-    """mAP = macro-moyenne des AP par classe"""
-    aps = {}
-    for class_id, name in enumerate(class_names_no_bg, start=1):
+def compute_map(predictions, ground_truths, iou_threshold=0.5):
+    all_classes = set()
+    for gt in ground_truths:
+        all_classes.update(gt['labels'].tolist())
+
+    aps = []
+    for cls in all_classes:
         tps, fps, scores_list = [], [], []
-        n_gt = sum((gt['labels'] == class_id).sum().item() for gt in ground_truths)
+        n_gt = sum((gt['labels'] == cls).sum().item() for gt in ground_truths)
         if n_gt == 0:
-            aps[name] = 0.0
             continue
+
         for pred, gt in zip(predictions, ground_truths):
-            mask_p   = pred['labels'] == class_id
-            mask_g   = gt['labels']   == class_id
+            mask_p  = pred['labels'] == cls
+            mask_g  = gt['labels']   == cls
             p_boxes  = pred['boxes'][mask_p].cpu().numpy()
             p_scores = pred['scores'][mask_p].cpu().numpy()
             g_boxes  = gt['boxes'][mask_g].cpu().numpy()
-            matched  = set()
+
+            matched = set()
             for i in np.argsort(-p_scores):
                 scores_list.append(p_scores[i])
                 if len(g_boxes) == 0:
-                    tps.append(0); fps.append(1); continue
+                    tps.append(0); fps.append(1)
+                    continue
                 ious   = [calculate_iou(p_boxes[i], g) for g in g_boxes]
                 best_j = int(np.argmax(ious))
                 if ious[best_j] >= iou_threshold and best_j not in matched:
-                    matched.add(best_j); tps.append(1); fps.append(0)
+                    matched.add(best_j)
+                    tps.append(1); fps.append(0)
                 else:
                     tps.append(0); fps.append(1)
+
         if not scores_list:
-            aps[name] = 0.0; continue
+            continue
         order     = np.argsort(-np.array(scores_list))
         tp_cum    = np.cumsum(np.array(tps)[order])
         fp_cum    = np.cumsum(np.array(fps)[order])
         precision = tp_cum / (tp_cum + fp_cum + 1e-10)
         recall    = tp_cum / (n_gt + 1e-10)
-        ap = sum(np.max(precision[recall >= t]) if (recall >= t).any() else 0
-                 for t in np.arange(0, 1.1, 0.1)) / 11
-        aps[name] = float(ap)
-    return float(np.mean(list(aps.values()))) if aps else 0.0, aps
+
+        ap = 0
+        for r_thresh in np.arange(0, 1.1, 0.1):
+            mask = recall >= r_thresh
+            ap  += np.max(precision[mask]) if mask.any() else 0
+        aps.append(ap / 11)
+
+    return float(np.mean(aps)) if aps else 0.0
 
 
 # =============================================================================
-# ENTRAÎNEMENT
+# BOUCLE D'ENTRAÎNEMENT
 # =============================================================================
 
-def train_one_epoch(model, optimizer, dataloader, device):
+def train_one_epoch(model, optimizer, dataloader, device, epoch, num_epochs):
     model.train()
     total_loss  = 0
     losses_dict = {'loss_classifier': 0, 'loss_box_reg': 0,
                    'loss_objectness': 0, 'loss_rpn_box_reg': 0}
     num_batches = 0
+
     for images, targets in dataloader:
         images  = [img.to(device) for img in images]
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
         if all(len(t['boxes']) == 0 for t in targets):
             continue
+
         try:
             loss_dict = model(images, targets)
             losses    = sum(loss for loss in loss_dict.values())
+
             optimizer.zero_grad()
             losses.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+
             total_loss += losses.item()
             for k in losses_dict:
                 losses_dict[k] += loss_dict.get(k, torch.tensor(0)).item()
             num_batches += 1
+
         except Exception as e:
             print(f"   ⚠️ Erreur batch: {e}")
             continue
-    n = max(num_batches, 1)
-    avg_loss = total_loss / n
+
+    avg_loss = total_loss / max(num_batches, 1)
     for k in losses_dict:
-        losses_dict[k] /= n
+        losses_dict[k] /= max(num_batches, 1)
+
     return avg_loss, losses_dict
 
 
 @torch.no_grad()
-def evaluate_epoch(model, dataloader, device, class_names_no_bg, score_threshold=0.3):
+def evaluate_epoch(model, dataloader, device, score_threshold=0.5):
     model.eval()
     all_preds = []
     all_gts   = []
+
     for images, targets in dataloader:
         images  = [img.to(device) for img in images]
         outputs = model(images)
+
         for output, target in zip(outputs, targets):
             keep = output['scores'] >= score_threshold
             all_preds.append({
@@ -377,8 +568,8 @@ def evaluate_epoch(model, dataloader, device, class_names_no_bg, score_threshold
                 'boxes':  target['boxes'],
                 'labels': target['labels'],
             })
-    map50, aps = compute_map(all_preds, all_gts, class_names_no_bg, iou_threshold=0.5)
-    return map50, aps
+
+    return compute_map(all_preds, all_gts, iou_threshold=0.5)
 
 
 # =============================================================================
@@ -388,28 +579,30 @@ def evaluate_epoch(model, dataloader, device, class_names_no_bg, score_threshold
 def train_fasterrcnn():
     CONFIG["classes"] = load_classes(CONFIG["classes_file"])
     num_classes       = len(CONFIG["classes"])
-    class_names_no_bg = [c for c in CONFIG["classes"] if c != '__background__']
 
     print("=" * 70)
     print("   Faster R-CNN (ResNet-50 FPN) - Détection des Toitures")
+    print("   Augmentation différentielle activée")
     print("=" * 70)
     print(f"\n📋 CONFIG (.env)")
     print(f"   Images:      {CONFIG['images_dir']}")
     print(f"   Annotations: {CONFIG['annotations_file']}")
     print(f"   Classes:     {num_classes} (avec __background__)")
     print(f"   Epochs:      {CONFIG['num_epochs']} | Batch: {CONFIG['batch_size']} | LR: {CONFIG['learning_rate']}")
-    print(f"   Image size:  {CONFIG['image_size']}px | Score threshold: {CONFIG['score_threshold']}")
-    print(f"   Augmentation: classes rares={sorted(RARE_CLASSES)}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"   Device:      {device}")
 
-    timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
-    train_dir   = os.path.join("runs", "detect", "train", f"fasterrcnn_{timestamp}")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    train_dir = os.path.join(CONFIG["output_dir"], f"fasterrcnn_{timestamp}")
+    os.makedirs(train_dir, exist_ok=True)
     weights_dir = os.path.join(train_dir, "weights")
     os.makedirs(weights_dir, exist_ok=True)
 
-    coco        = COCO(CONFIG["annotations_file"])
+    # -------------------------------------------------------------------------
+    # Split
+    # -------------------------------------------------------------------------
+    coco = COCO(CONFIG["annotations_file"])
     cat_ids     = coco.getCatIds()
     cat_mapping = {cat_id: idx + 1 for idx, cat_id in enumerate(cat_ids)}
 
@@ -418,49 +611,84 @@ def train_fasterrcnn():
     )
     print_split_stats(coco, split_stats)
 
+    # Sauvegarder les IDs du test set
     test_info = {
-        'test_image_ids':   test_ids,
-        'cat_mapping':      {str(k): v for k, v in cat_mapping.items()},
-        'images_dir':       os.path.abspath(CONFIG["images_dir"]),
-        'annotations_file': os.path.abspath(CONFIG["annotations_file"]),
-        'num_test_images':  len(test_ids),
-        'classes':          CONFIG["classes"],
-        'image_size':       CONFIG["image_size"],
+        'test_image_ids':  test_ids,
+        'cat_mapping':     {str(k): v for k, v in cat_mapping.items()},
+        'images_dir':      CONFIG["images_dir"],
+        'annotations_file':CONFIG["annotations_file"],
+        'num_test_images': len(test_ids),
     }
     with open(os.path.join(train_dir, "test_info.json"), 'w') as f:
         json.dump(test_info, f, indent=2)
 
-    train_dataset = CocoDetectionDataset(CONFIG["images_dir"], CONFIG["annotations_file"],
-                                         train_ids, cat_mapping, CONFIG["image_size"], augment=True)
-    val_dataset   = CocoDetectionDataset(CONFIG["images_dir"], CONFIG["annotations_file"],
-                                         val_ids,   cat_mapping, CONFIG["image_size"])
+    # -------------------------------------------------------------------------
+    # Poids du sampler
+    # -------------------------------------------------------------------------
+    rare_class_names   = list(CONFIG["rare_class_weights"].keys())
+    sample_weights_arr = compute_sample_weights(
+        coco, train_ids, cat_mapping, CONFIG["rare_class_weights"], CONFIG["classes"]
+    )
+    sampler = WeightedRandomSampler(
+        weights     = sample_weights_arr,
+        num_samples = len(sample_weights_arr),
+        replacement = True,
+    )
 
-    train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=True,
-                              collate_fn=collate_fn, num_workers=0)
-    val_loader   = DataLoader(val_dataset,   batch_size=1, shuffle=False,
-                              collate_fn=collate_fn, num_workers=0)
+    # -------------------------------------------------------------------------
+    # Datasets & DataLoaders
+    # -------------------------------------------------------------------------
+    train_dataset = CocoDetectionDataset(
+        CONFIG["images_dir"], CONFIG["annotations_file"],
+        train_ids, cat_mapping, CONFIG["image_size"],
+        augment=True, rare_class_names=rare_class_names,
+    )
+    val_dataset = CocoDetectionDataset(
+        CONFIG["images_dir"], CONFIG["annotations_file"],
+        val_ids, cat_mapping, CONFIG["image_size"],
+        augment=False,
+    )
 
-    print(f"\n   Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_ids)} images")
+    # shuffle=False car on utilise un sampler custom
+    train_loader = DataLoader(
+        train_dataset, batch_size=CONFIG["batch_size"],
+        sampler=sampler, collate_fn=collate_fn, num_workers=0,
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=1, shuffle=False,
+        collate_fn=collate_fn, num_workers=0,
+    )
 
+    print(f"\n   Train: {len(train_dataset)} images | Val: {len(val_dataset)} images | Test: {len(test_ids)} images")
+
+    # -------------------------------------------------------------------------
+    # Modèle & Optimiseur
+    # -------------------------------------------------------------------------
     print(f"\n🧠 Chargement Faster R-CNN ResNet-50 FPN (pretrained={CONFIG['pretrained']})...")
-    model = build_model(num_classes, pretrained=CONFIG["pretrained"])
+    model     = build_model(num_classes, pretrained=CONFIG["pretrained"])
     model.to(device)
 
-    params       = [p for p in model.parameters() if p.requires_grad]
-    optimizer    = torch.optim.SGD(params, lr=CONFIG["learning_rate"],
-                                   momentum=CONFIG["momentum"],
-                                   weight_decay=CONFIG["weight_decay"])
+    params    = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(params,
+                                lr=CONFIG["learning_rate"],
+                                momentum=CONFIG["momentum"],
+                                weight_decay=CONFIG["weight_decay"])
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
 
+    # -------------------------------------------------------------------------
+    # Boucle d'entraînement
+    # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
     print(f"   🚀 ENTRAÎNEMENT - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 70)
 
     history = {
-        'train_loss': [], 'val_map50': [], 'val_ap_per_class': [],
+        'train_loss': [], 'val_map50': [],
         'loss_classifier': [], 'loss_box_reg': [],
-        'loss_objectness': [], 'loss_rpn_box_reg': [], 'lr': [],
+        'loss_objectness': [], 'loss_rpn_box_reg': [],
+        'lr': [],
     }
+
     best_map50 = 0.0
     start_time = time.time()
 
@@ -468,15 +696,15 @@ def train_fasterrcnn():
         epoch_start = time.time()
         print(f"\n📅 Epoch [{epoch}/{CONFIG['num_epochs']}]")
 
-        avg_loss, losses_dict = train_one_epoch(model, optimizer, train_loader, device)
-        val_map50, val_aps    = evaluate_epoch(model, val_loader, device,
-                                               class_names_no_bg, CONFIG["score_threshold"])
+        avg_loss, losses_dict = train_one_epoch(
+            model, optimizer, train_loader, device, epoch, CONFIG["num_epochs"]
+        )
+        val_map50    = evaluate_epoch(model, val_loader, device, CONFIG["score_threshold"])
         lr_scheduler.step()
 
         current_lr = optimizer.param_groups[0]['lr']
         history['train_loss'].append(avg_loss)
         history['val_map50'].append(val_map50)
-        history['val_ap_per_class'].append(val_aps)
         history['loss_classifier'].append(losses_dict['loss_classifier'])
         history['loss_box_reg'].append(losses_dict['loss_box_reg'])
         history['loss_objectness'].append(losses_dict['loss_objectness'])
@@ -485,8 +713,6 @@ def train_fasterrcnn():
 
         epoch_time = time.time() - epoch_start
         print(f"   Loss: {avg_loss:.4f} | mAP@50: {val_map50:.4f} | LR: {current_lr:.6f} | ⏱️ {format_time(epoch_time)}")
-        for name, ap in val_aps.items():
-            print(f"      {name:<30} AP={ap:.3f}")
 
         if val_map50 > best_map50:
             best_map50 = val_map50
@@ -498,7 +724,6 @@ def train_fasterrcnn():
                 'num_classes':          num_classes,
                 'classes':              CONFIG["classes"],
                 'cat_mapping':          cat_mapping,
-                'image_size':           CONFIG["image_size"],
             }, os.path.join(weights_dir, "best.pth"))
             print(f"   💾 Meilleur modèle sauvegardé (mAP@50: {best_map50:.4f})")
 
@@ -511,23 +736,27 @@ def train_fasterrcnn():
                 'num_classes':          num_classes,
                 'classes':              CONFIG["classes"],
                 'cat_mapping':          cat_mapping,
-                'image_size':           CONFIG["image_size"],
             }, os.path.join(weights_dir, "last.pth"))
 
     total_time = time.time() - start_time
 
-    print("\n📦 Copie des modèles...")
+    # -------------------------------------------------------------------------
+    # Copier les modèles finaux
+    # -------------------------------------------------------------------------
     for src, dst in [("best.pth", "best_model.pth"), ("last.pth", "final_model.pth")]:
         src_path = os.path.join(weights_dir, src)
         dst_path = os.path.join(train_dir, dst)
         if os.path.exists(src_path):
             shutil.copy2(src_path, dst_path)
-            print(f"   ✅ {dst} ({os.path.getsize(dst_path)/1024/1024:.1f} MB)")
+            print(f"   ✅ {dst} ({os.path.getsize(dst_path) / 1024 / 1024:.1f} MB)")
 
+    # -------------------------------------------------------------------------
+    # Historique + graphiques + rapport
+    # -------------------------------------------------------------------------
     history['time_stats'] = {
-        'total_time':               total_time,
-        'total_time_formatted':     format_time(total_time),
-        'avg_epoch_time_formatted': format_time(total_time / CONFIG["num_epochs"]),
+        'total_time':              total_time,
+        'total_time_formatted':    format_time(total_time),
+        'avg_epoch_time_formatted':format_time(total_time / CONFIG["num_epochs"]),
     }
     history['config']     = CONFIG
     history['best_map50'] = best_map50
@@ -537,19 +766,24 @@ def train_fasterrcnn():
 
     epochs = range(1, len(history['train_loss']) + 1)
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    axes[0, 0].plot(epochs, history['train_loss'], 'b-')
-    axes[0, 0].set_title('Loss totale'); axes[0, 0].grid(True, alpha=0.3)
-    axes[0, 1].plot(epochs, history['val_map50'], 'g-')
-    axes[0, 1].set_title('mAP@50 (Validation — macro-moyenne)')
-    axes[0, 1].set_ylim(0, 1); axes[0, 1].grid(True, alpha=0.3)
+
+    axes[0, 0].plot(epochs, history['train_loss'], 'b-', label='Train Loss')
+    axes[0, 0].set_title('Loss totale'); axes[0, 0].legend(); axes[0, 0].grid(True, alpha=0.3)
+
+    axes[0, 1].plot(epochs, history['val_map50'], 'g-', label='mAP@50')
+    axes[0, 1].set_title('mAP@50 (Validation)'); axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3); axes[0, 1].set_ylim(0, 1)
+
     axes[1, 0].plot(epochs, history['loss_classifier'], label='Classifier')
     axes[1, 0].plot(epochs, history['loss_box_reg'],    label='Box Reg')
     axes[1, 0].set_title('Losses classification & box')
     axes[1, 0].legend(); axes[1, 0].grid(True, alpha=0.3)
+
     axes[1, 1].plot(epochs, history['loss_objectness'],  label='Objectness')
     axes[1, 1].plot(epochs, history['loss_rpn_box_reg'], label='RPN Box Reg')
     axes[1, 1].set_title('Losses RPN')
     axes[1, 1].legend(); axes[1, 1].grid(True, alpha=0.3)
+
     plt.tight_layout()
     plt.savefig(os.path.join(train_dir, 'training_curves.png'), dpi=150)
     plt.close()
@@ -557,14 +791,14 @@ def train_fasterrcnn():
     with open(os.path.join(train_dir, "training_report.txt"), 'w', encoding='utf-8') as f:
         f.write("Faster R-CNN (ResNet-50 FPN) - Rapport\n")
         f.write("=" * 50 + "\n\n")
-        f.write(f"Dataset:         {CONFIG['images_dir']}\n")
-        f.write(f"Classes:         {CONFIG['classes']}\n")
-        f.write(f"Epochs:          {CONFIG['num_epochs']} | Batch: {CONFIG['batch_size']}\n")
-        f.write(f"Score threshold: {CONFIG['score_threshold']}\n")
-        f.write(f"Classes rares:   {sorted(RARE_CLASSES)}\n\n")
-        f.write(f"Meilleur mAP@50: {best_map50:.4f} ({best_map50*100:.2f}%)\n")
-        f.write(f"Temps total:     {format_time(total_time)}\n")
-        f.write(f"Chemin:          {train_dir}\n")
+        f.write(f"Dataset: {CONFIG['images_dir']}\n")
+        f.write(f"Classes: {CONFIG['classes']}\n")
+        f.write(f"Augmentation différentielle: activée\n")
+        f.write(f"Classes rares sur-échantillonnées: {rare_class_names}\n")
+        f.write(f"Epochs: {CONFIG['num_epochs']} | Batch: {CONFIG['batch_size']}\n\n")
+        f.write(f"Meilleur mAP@50: {best_map50:.4f}\n")
+        f.write(f"Temps total: {format_time(total_time)}\n")
+        f.write(f"Chemin: {train_dir}\n")
 
     print("\n" + "=" * 70)
     print("   🎉 TERMINÉ")
