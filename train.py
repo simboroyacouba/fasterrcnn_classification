@@ -249,9 +249,11 @@ def calculate_iou(box1, box2):
 
 def compute_map(predictions, ground_truths, iou_threshold=0.5):
     """Calculer mAP pour toutes les classes"""
-    all_classes = set()
+    # Toutes les classes connues (sans __background__ = index 0)
+    all_classes = set(range(1, len(CONFIG["classes"])))
     for gt in ground_truths:
         all_classes.update(gt['labels'].tolist())
+    all_classes.discard(0)  # exclure __background__
 
     aps = []
     per_class_ap = {}
@@ -283,6 +285,8 @@ def compute_map(predictions, ground_truths, iou_threshold=0.5):
                     tps.append(0); fps.append(1)
 
         if not scores_list:
+            aps.append(0.0)
+            per_class_ap[cls] = 0.0
             continue
         order = np.argsort(-np.array(scores_list))
         tp_cum = np.cumsum(np.array(tps)[order])
