@@ -7,6 +7,7 @@ Configuration: .env + classes.yaml
 import os
 import json
 import yaml
+import argparse
 import numpy as np
 import torch
 import torchvision.transforms.functional as TF
@@ -55,6 +56,10 @@ CONFIG = {
     "image_size":   int(os.getenv("IMAGE_SIZE", "640")),
     "score_threshold": float(os.getenv("SCORE_THRESHOLD", "0.5")),
     "iou_thresholds": [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95],
+
+    # Chemins spécifiques par mode
+    "nadir_classes_file":   os.getenv("NADIR_CLASSES_FILE",   "classes_nadir.yaml"),
+    "oblique_classes_file": os.getenv("OBLIQUE_CLASSES_FILE", "classes_oblique.yaml"),
 }
 CONFIG["classes"] = load_classes(CONFIG["classes_file"])
 
@@ -86,33 +91,47 @@ def load_model(model_path, device):
     return model, classes, cat_mapping
 
 
-def find_model():
-    """Trouver automatiquement le meilleur modèle"""
+def find_model(mode="all"):
+    """Trouver automatiquement le meilleur modèle pour le mode donné."""
     path = CONFIG["model_path"]
     if path and os.path.exists(path):
         return path
 
-    # Chercher dans runs/detect/train/ (dossier le plus récent en premier)
-    runs_base = os.path.join("runs", "detect", "train")
-    if os.path.exists(runs_base):
-        # Lister les sous-dossiers triés par date décroissante
+    output_base = "output"
+    if os.path.exists(output_base):
+        # Préfixe selon le mode : fasterrcnn_nadir_* / fasterrcnn_oblique_* / fasterrcnn_*
+        prefix = f"fasterrcnn_{mode}_" if mode != "all" else "fasterrcnn_"
         subdirs = sorted(
-            [d for d in os.listdir(runs_base) if os.path.isdir(os.path.join(runs_base, d))],
-            reverse=True
+            [d for d in os.listdir(output_base)
+             if os.path.isdir(os.path.join(output_base, d)) and d.startswith(prefix)],
+            reverse=True  # plus récent en premier
         )
         for subdir in subdirs:
             for fname in ["best_model.pth", "best.pth"]:
-                candidate = os.path.join(runs_base, subdir, fname)
+                candidate = os.path.join(output_base, subdir, fname)
                 if os.path.exists(candidate):
-                    print(f"📁 Modèle trouvé: {candidate}")
+                    print(f"   Modele trouve: {candidate}")
                     return candidate
 
-    # Chercher aussi dans output/
-    for root, dirs, files in os.walk("output"):
-        for fname in ["best_model.pth", "best.pth"]:
-            if fname in files:
-                return os.path.join(root, fname)
+    return None
 
+
+def find_test_info(mode="all"):
+    """Trouver le test_info.json correspondant au mode."""
+    output_base = "output"
+    if not os.path.exists(output_base):
+        return None
+
+    prefix = f"fasterrcnn_{mode}_" if mode != "all" else "fasterrcnn_"
+    subdirs = sorted(
+        [d for d in os.listdir(output_base)
+         if os.path.isdir(os.path.join(output_base, d)) and d.startswith(prefix)],
+        reverse=True
+    )
+    for subdir in subdirs:
+        candidate = os.path.join(output_base, subdir, "test_info.json")
+        if os.path.exists(candidate):
+            return candidate
     return None
 
 
@@ -307,24 +326,44 @@ def plot_metrics(results, output_dir):
 # =============================================================================
 
 def main():
+    parser = argparse.ArgumentParser(description="Evaluation Faster R-CNN")
+    parser.add_argument(
+        "--mode", choices=["nadir", "oblique", "all"], default="all",
+        help="nadir / oblique / all (defaut: all)"
+    )
+    parser.add_argument("--model", default=None, help="Chemin direct vers le modele .pth")
+    args = parser.parse_args()
+    mode = args.mode
+
+    # Surcharger classes_file selon le mode
+    if mode == "nadir":
+        CONFIG["classes_file"] = CONFIG["nadir_classes_file"]
+    elif mode == "oblique":
+        CONFIG["classes_file"] = CONFIG["oblique_classes_file"]
+    CONFIG["classes"] = load_classes(CONFIG["classes_file"])
+
+    # Répertoire de sortie spécifique au mode
+    output_dir = os.path.join(CONFIG["output_dir"], mode)
+    os.makedirs(output_dir, exist_ok=True)
+
     print("=" * 70)
-    print("   ÉVALUATION Faster R-CNN - TEST SET (10%)")
+    print(f"   EVALUATION Faster R-CNN - TEST SET - Mode : {mode.upper()}")
     print("=" * 70)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"   Device: {device}")
 
     # Trouver le modèle
-    model_path = find_model()
+    model_path = args.model or find_model(mode)
     if model_path is None or not os.path.exists(model_path):
-        print("❌ Modèle non trouvé! Spécifiez MODEL_PATH dans .env ou lancez train.py d'abord.")
+        print(f"   Modele non trouve pour le mode '{mode}'.")
+        print("   Lancez : python train.py --mode " + mode)
         return
 
     # Charger le modèle et récupérer les infos
     model, classes, cat_mapping = load_model(model_path, device)
 
-    # Trouver test_info.json — chercher dans le même dossier que le modèle,
-    # puis dans runs/detect/train/ (le plus récent), puis dans output/
+    # Trouver test_info.json
     test_info_path = None
 
     # 1. Même répertoire que le modèle
@@ -332,29 +371,12 @@ def main():
     if os.path.exists(sibling):
         test_info_path = sibling
 
-    # 2. Dans runs/detect/train/ (le plus récent en premier)
+    # 2. Dans output/fasterrcnn_{mode}_* (le plus récent)
     if test_info_path is None:
-        runs_base = os.path.join("runs", "detect", "train")
-        if os.path.exists(runs_base):
-            subdirs = sorted(
-                [d for d in os.listdir(runs_base) if os.path.isdir(os.path.join(runs_base, d))],
-                reverse=True
-            )
-            for subdir in subdirs:
-                candidate = os.path.join(runs_base, subdir, "test_info.json")
-                if os.path.exists(candidate):
-                    test_info_path = candidate
-                    break
-
-    # 3. Dans output/
-    if test_info_path is None:
-        for root, dirs, files in os.walk("output"):
-            if "test_info.json" in files:
-                test_info_path = os.path.join(root, "test_info.json")
-                break
+        test_info_path = find_test_info(mode)
 
     if test_info_path is None:
-        print("❌ test_info.json non trouvé! Lancez train.py d'abord.")
+        print("   test_info.json non trouve! Lancez train.py --mode " + mode + " d'abord.")
         return
 
     with open(test_info_path, 'r') as f:
@@ -369,8 +391,6 @@ def main():
     print(f"   Modèle:   {model_path}")
     print(f"   Test set: {len(test_image_ids)} images")
     print(f"   Classes:  {classes}")
-
-    os.makedirs(CONFIG["output_dir"], exist_ok=True)
 
     # Dataset test
     test_dataset = TestDataset(images_dir, annotations_file, test_image_ids, cat_mapping_int, CONFIG["image_size"])
@@ -423,12 +443,12 @@ def main():
             print(f"   {name:<30} P={m['Precision']:.3f} R={m['Recall']:.3f} F1={m['F1']:.3f}")
 
     # Sauvegarder
-    with open(os.path.join(CONFIG["output_dir"], "metrics_test_set.json"), 'w') as f:
+    with open(os.path.join(output_dir, "metrics_test_set.json"), 'w') as f:
         json.dump(results, f, indent=2, default=float)
 
-    plot_metrics(results, CONFIG["output_dir"])
+    plot_metrics(results, output_dir)
 
-    with open(os.path.join(CONFIG["output_dir"], "evaluation_report_test_set.txt"), 'w', encoding='utf-8') as f:
+    with open(os.path.join(output_dir, "evaluation_report_test_set.txt"), 'w', encoding='utf-8') as f:
         f.write(f"ÉVALUATION Faster R-CNN - TEST SET - {datetime.now()}\n")
         f.write("=" * 50 + "\n\n")
         f.write(f"Images testées: {len(test_image_ids)}\n")
@@ -445,7 +465,7 @@ def main():
                 m = results['per_class'][name]['iou_0.5']
                 f.write(f"{name}: P={m['Precision']:.4f} R={m['Recall']:.4f} F1={m['F1']:.4f}\n")
 
-    print(f"\n📁 Résultats sauvegardés: {CONFIG['output_dir']}")
+    print(f"\n   Resultats sauvegardes: {output_dir}")
 
 
 if __name__ == "__main__":

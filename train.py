@@ -10,6 +10,7 @@ import json
 import yaml
 import shutil
 import random
+import argparse
 import numpy as np
 from PIL import Image, ImageFilter
 import matplotlib.pyplot as plt
@@ -84,6 +85,12 @@ CONFIG = {
         "batiment_non_enduit": 2.0,
         "batiment_enduit":     1.5,
     },
+
+    # Chemins spécifiques par mode (surchargent annotations_file et classes_file)
+    "nadir_annotations_file":   os.getenv("NADIR_ANNOTATIONS_FILE",   ""),
+    "nadir_classes_file":       os.getenv("NADIR_CLASSES_FILE",       "classes_nadir.yaml"),
+    "oblique_annotations_file": os.getenv("OBLIQUE_ANNOTATIONS_FILE", ""),
+    "oblique_classes_file":     os.getenv("OBLIQUE_CLASSES_FILE",     "classes_oblique.yaml"),
 }
 
 
@@ -474,13 +481,36 @@ def evaluate_epoch(model, dataloader, device, score_threshold=0.5):
 # =============================================================================
 
 def train_fasterrcnn():
+    # -------------------------------------------------------------------------
+    # Mode nadir | oblique | all
+    # -------------------------------------------------------------------------
+    parser = argparse.ArgumentParser(description="Entrainement Faster R-CNN")
+    parser.add_argument(
+        "--mode", choices=["nadir", "oblique", "all"], default="all",
+        help="nadir=Production_*.png / oblique=Snapshot_*.jpg / all=dataset complet"
+    )
+    args = parser.parse_args()
+    mode = args.mode
+
+    if mode == "nadir":
+        if CONFIG["nadir_annotations_file"]:
+            CONFIG["annotations_file"] = CONFIG["nadir_annotations_file"]
+        CONFIG["classes_file"]      = CONFIG["nadir_classes_file"]
+        CONFIG["rare_class_weights"] = {}   # 1 seule classe, pas de pondération
+    elif mode == "oblique":
+        if CONFIG["oblique_annotations_file"]:
+            CONFIG["annotations_file"] = CONFIG["oblique_annotations_file"]
+        CONFIG["classes_file"] = CONFIG["oblique_classes_file"]
+        # rare_class_weights inchangé (batiment_peint ×3, etc.)
+
     CONFIG["classes"] = load_classes(CONFIG["classes_file"])
     num_classes = len(CONFIG["classes"])  # inclut __background__
 
     print("=" * 70)
-    print("   Faster R-CNN (ResNet-50 FPN) - Détection des Toitures")
+    print(f"   Faster R-CNN (ResNet-50 FPN) - Mode : {mode.upper()}")
     print("=" * 70)
-    print(f"\n📋 CONFIG (.env)")
+    print(f"\n   CONFIG (.env)")
+    print(f"   Mode:        {mode}")
     print(f"   Images:      {CONFIG['images_dir']}")
     print(f"   Annotations: {CONFIG['annotations_file']}")
     print(f"   Classes:     {num_classes} (avec __background__)")
@@ -489,9 +519,9 @@ def train_fasterrcnn():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"   Device:      {device}")
 
-    # Répertoire de sortie
+    # Répertoire de sortie — inclut le mode dans le nom
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    train_dir = os.path.join(CONFIG["output_dir"], f"fasterrcnn_{timestamp}")
+    train_dir = os.path.join(CONFIG["output_dir"], f"fasterrcnn_{mode}_{timestamp}")
     os.makedirs(train_dir, exist_ok=True)
     weights_dir = os.path.join(train_dir, "weights")
     os.makedirs(weights_dir, exist_ok=True)
