@@ -254,6 +254,7 @@ def compute_map(predictions, ground_truths, iou_threshold=0.5):
         all_classes.update(gt['labels'].tolist())
 
     aps = []
+    per_class_ap = {}
     for cls in all_classes:
         tps, fps, scores_list = [], [], []
         n_gt = sum((gt['labels'] == cls).sum().item() for gt in ground_truths)
@@ -294,9 +295,11 @@ def compute_map(predictions, ground_truths, iou_threshold=0.5):
         for r_thresh in np.arange(0, 1.1, 0.1):
             mask = recall >= r_thresh
             ap  += np.max(precision[mask]) if mask.any() else 0
-        aps.append(ap / 11)
+        ap /= 11
+        aps.append(ap)
+        per_class_ap[cls] = ap
 
-    return float(np.mean(aps)) if aps else 0.0
+    return float(np.mean(aps)) if aps else 0.0, per_class_ap
 
 
 # =============================================================================
@@ -364,8 +367,11 @@ def evaluate_epoch(model, dataloader, device, score_threshold=0.5):
                 'labels': target['labels'],
             })
 
-    map50 = compute_map(all_preds, all_gts, iou_threshold=0.5)
-    return map50
+    map50, per_class_ap = compute_map(all_preds, all_gts, iou_threshold=0.5)
+    # Convertir les indices en noms de classes
+    classes = CONFIG["classes"]
+    per_class_named = {classes[cls]: ap for cls, ap in per_class_ap.items() if cls < len(classes)}
+    return map50, per_class_named
 
 
 # =============================================================================
@@ -470,7 +476,7 @@ def train_fasterrcnn():
         print(f"\n📅 Epoch [{epoch}/{CONFIG['num_epochs']}]")
 
         avg_loss, losses_dict = train_one_epoch(model, optimizer, train_loader, device, epoch, CONFIG["num_epochs"])
-        val_map50 = evaluate_epoch(model, val_loader, device, CONFIG["score_threshold"])
+        val_map50, per_class_ap = evaluate_epoch(model, val_loader, device, CONFIG["score_threshold"])
         lr_scheduler.step()
 
         current_lr = optimizer.param_groups[0]['lr']
@@ -484,6 +490,10 @@ def train_fasterrcnn():
 
         epoch_time = time.time() - epoch_start
         print(f"   Loss: {avg_loss:.4f} | mAP@50: {val_map50:.4f} | LR: {current_lr:.6f} | ⏱️ {format_time(epoch_time)}")
+        for cls_name, ap in per_class_ap.items():
+            if cls_name == '__background__':
+                continue
+            print(f"      {cls_name:<30} AP@50: {ap:.4f}")
 
         # Sauvegarder le meilleur modèle
         if val_map50 > best_map50:
