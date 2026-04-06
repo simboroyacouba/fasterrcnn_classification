@@ -9,16 +9,17 @@ import os
 import json
 import yaml
 import shutil
+import random
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 import matplotlib.pyplot as plt
 from datetime import datetime
 import time
 import gc
 import torch
-import torchvision
 from torchvision.models.detection import fasterrcnn_resnet50_fpn, FasterRCNN_ResNet50_FPN_Weights
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.transforms import ColorJitter
 import torchvision.transforms.functional as TF
 from torch.utils.data import Dataset, DataLoader
 from pycocotools.coco import COCO
@@ -153,6 +154,63 @@ def print_split_stats(coco, stats):
 # DATASET PYTORCH
 # =============================================================================
 
+def augment_sample(image, boxes, labels, image_size):
+    """
+    Augmentations géométriques et photométriques.
+    boxes  : liste de [x1, y1, x2, y2] déjà scalées sur image_size.
+    labels : liste d'entiers, même longueur que boxes.
+    Retourne (image PIL, boxes liste, labels liste).
+    """
+    W = H = image_size
+
+    # --- Photométrique (image seule) ---
+    if random.random() < 0.5:
+        jitter = ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05)
+        image = jitter(image)
+
+    if random.random() < 0.3:
+        blur_radius = random.uniform(0.5, 1.5) * (image_size / 640)
+        image = image.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    # --- Géométrique ---
+    # Flip horizontal
+    if random.random() < 0.5:
+        image = TF.hflip(image)
+        boxes = [[W - x2, y1, W - x1, y2] for x1, y1, x2, y2 in boxes]
+
+    # Flip vertical
+    if random.random() < 0.5:
+        image = TF.vflip(image)
+        boxes = [[x1, H - y2, x2, H - y1] for x1, y1, x2, y2 in boxes]
+
+    # Rotation 90° / 180° / 270° (images aériennes : toutes orientations valides)
+    angle = random.choice([0, 90, 180, 270])
+    if angle == 90:
+        image = TF.rotate(image, 90, expand=False)
+        boxes = [[y1, W - x2, y2, W - x1] for x1, y1, x2, y2 in boxes]
+    elif angle == 180:
+        image = TF.rotate(image, 180, expand=False)
+        boxes = [[W - x2, H - y2, W - x1, H - y1] for x1, y1, x2, y2 in boxes]
+    elif angle == 270:
+        image = TF.rotate(image, 270, expand=False)
+        boxes = [[H - y2, x1, H - y1, x2] for x1, y1, x2, y2 in boxes]
+
+    # Clamp et filtrer les boxes dégénérées (label suivi par index)
+    kept = [
+        (i, [max(0, x1), max(0, y1), min(W, x2), min(H, y2)])
+        for i, (x1, y1, x2, y2) in enumerate(boxes)
+        if x2 > x1 and y2 > y1
+    ]
+    if kept:
+        idxs, boxes = zip(*kept)
+        boxes  = list(boxes)
+        labels = [labels[i] for i in idxs]
+    else:
+        boxes, labels = [], []
+
+    return image, boxes, labels
+
+
 class CocoDetectionDataset(Dataset):
     """Dataset COCO pour Faster R-CNN"""
 
@@ -180,9 +238,6 @@ class CocoDetectionDataset(Dataset):
         scale_x = self.image_size / orig_w
         scale_y = self.image_size / orig_h
 
-        # Convertir en tensor [C, H, W] float32 dans [0, 1]
-        image_tensor = TF.to_tensor(image)
-
         # Annotations
         anns    = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id))
         boxes   = []
@@ -204,6 +259,13 @@ class CocoDetectionDataset(Dataset):
             if x2 > x1 and y2 > y1:
                 boxes.append([x1, y1, x2, y2])
                 labels.append(class_id)
+
+        # Augmentation (train uniquement)
+        if self.augment and len(boxes) > 0:
+            image, boxes, labels = augment_sample(image, boxes, labels, self.image_size)
+
+        # Convertir en tensor [C, H, W] float32 dans [0, 1]
+        image_tensor = TF.to_tensor(image)
 
         target = {
             'boxes':    torch.tensor(boxes,  dtype=torch.float32) if boxes  else torch.zeros((0, 4), dtype=torch.float32),
@@ -479,11 +541,10 @@ def train_fasterrcnn():
         epoch_start = time.time()
         print(f"\n📅 Epoch [{epoch}/{CONFIG['num_epochs']}]")
 
+        current_lr = optimizer.param_groups[0]['lr']
         avg_loss, losses_dict = train_one_epoch(model, optimizer, train_loader, device, epoch, CONFIG["num_epochs"])
         val_map50, per_class_ap = evaluate_epoch(model, val_loader, device, CONFIG["score_threshold"])
         lr_scheduler.step()
-
-        current_lr = optimizer.param_groups[0]['lr']
         history['train_loss'].append(avg_loss)
         history['val_map50'].append(val_map50)
         history['loss_classifier'].append(losses_dict['loss_classifier'])
