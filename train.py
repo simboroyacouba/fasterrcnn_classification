@@ -21,7 +21,7 @@ from torchvision.models.detection import fasterrcnn_resnet50_fpn, FasterRCNN_Res
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.transforms import ColorJitter
 import torchvision.transforms.functional as TF
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from pycocotools.coco import COCO
 import warnings
 warnings.filterwarnings('ignore')
@@ -77,6 +77,13 @@ CONFIG = {
     "save_every":        int(os.getenv("SAVE_EVERY", "5")),
     "score_threshold":   float(os.getenv("SCORE_THRESHOLD", "0.5")),
     "pretrained":        os.getenv("PRETRAINED", "true").lower() == "true",
+
+    # Poids de sur-échantillonnage par classe (prend le max si plusieurs classes rares sur la même image)
+    "rare_class_weights": {
+        "batiment_peint":      3.0,
+        "batiment_non_enduit": 2.0,
+        "batiment_enduit":     1.5,
+    },
 }
 
 
@@ -153,6 +160,28 @@ def print_split_stats(coco, stats):
 # =============================================================================
 # DATASET PYTORCH
 # =============================================================================
+
+def compute_sample_weights(coco, image_ids, cat_mapping, classes, rare_class_weights):
+    """
+    Calcule un poids par image pour WeightedRandomSampler.
+    Une image contenant une classe rare reçoit le poids max parmi ses classes.
+    """
+    class_idx_to_weight = {
+        classes.index(name): weight
+        for name, weight in rare_class_weights.items()
+        if name in classes
+    }
+    weights = []
+    for img_id in image_ids:
+        anns = coco.loadAnns(coco.getAnnIds(imgIds=img_id))
+        img_weight = 1.0
+        for ann in anns:
+            cls_idx = cat_mapping.get(ann['category_id'])
+            if cls_idx in class_idx_to_weight:
+                img_weight = max(img_weight, class_idx_to_weight[cls_idx])
+        weights.append(img_weight)
+    return weights
+
 
 def augment_sample(image, boxes, labels, image_size):
     """
@@ -499,7 +528,14 @@ def train_fasterrcnn():
     val_dataset   = CocoDetectionDataset(CONFIG["images_dir"], CONFIG["annotations_file"],
                                          val_ids,   cat_mapping, CONFIG["image_size"])
 
-    train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=True,
+    sample_weights = compute_sample_weights(
+        coco, train_ids, cat_mapping, CONFIG["classes"], CONFIG["rare_class_weights"]
+    )
+    sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+    n_rare = sum(1 for w in sample_weights if w > 1.0)
+    print(f"   WeightedSampler: {n_rare}/{len(sample_weights)} images avec classes rares surreprésentées")
+
+    train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], sampler=sampler,
                               collate_fn=collate_fn, num_workers=0)
     val_loader   = DataLoader(val_dataset,   batch_size=1, shuffle=False,
                               collate_fn=collate_fn, num_workers=0)
