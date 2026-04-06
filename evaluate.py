@@ -91,45 +91,54 @@ def load_model(model_path, device):
     return model, classes, cat_mapping
 
 
+def _list_output_dirs(mode):
+    """
+    Retourne les paires (base, subdir) pour le mode donné, triées du plus récent.
+    Cherche dans OUTPUT_DIR puis dans runs/detect/train/ comme fallback.
+    """
+    candidates = []
+    search_bases = [
+        os.getenv("OUTPUT_DIR", "./output"),
+        "./runs/detect/train",
+    ]
+    for base in search_bases:
+        if not os.path.exists(base):
+            continue
+        if mode != "all":
+            prefix = f"fasterrcnn_{mode}_"
+            dirs = [d for d in os.listdir(base)
+                    if os.path.isdir(os.path.join(base, d)) and d.startswith(prefix)]
+        else:
+            dirs = [d for d in os.listdir(base)
+                    if os.path.isdir(os.path.join(base, d))
+                    and d.startswith("fasterrcnn_")
+                    and not d.startswith("fasterrcnn_nadir_")
+                    and not d.startswith("fasterrcnn_oblique_")]
+        for d in sorted(dirs, reverse=True):
+            candidates.append(os.path.join(base, d))
+
+    return candidates
+
+
 def find_model(mode="all"):
     """Trouver automatiquement le meilleur modèle pour le mode donné."""
     path = CONFIG["model_path"]
     if path and os.path.exists(path):
         return path
 
-    output_base = "output"
-    if os.path.exists(output_base):
-        # Préfixe selon le mode : fasterrcnn_nadir_* / fasterrcnn_oblique_* / fasterrcnn_*
-        prefix = f"fasterrcnn_{mode}_" if mode != "all" else "fasterrcnn_"
-        subdirs = sorted(
-            [d for d in os.listdir(output_base)
-             if os.path.isdir(os.path.join(output_base, d)) and d.startswith(prefix)],
-            reverse=True  # plus récent en premier
-        )
-        for subdir in subdirs:
-            for fname in ["best_model.pth", "best.pth"]:
-                candidate = os.path.join(output_base, subdir, fname)
-                if os.path.exists(candidate):
-                    print(f"   Modele trouve: {candidate}")
-                    return candidate
-
+    for train_dir in _list_output_dirs(mode):
+        for fname in ["best_model.pth", "best.pth"]:
+            candidate = os.path.join(train_dir, fname)
+            if os.path.exists(candidate):
+                print(f"   Modele trouve: {candidate}")
+                return candidate
     return None
 
 
 def find_test_info(mode="all"):
     """Trouver le test_info.json correspondant au mode."""
-    output_base = "output"
-    if not os.path.exists(output_base):
-        return None
-
-    prefix = f"fasterrcnn_{mode}_" if mode != "all" else "fasterrcnn_"
-    subdirs = sorted(
-        [d for d in os.listdir(output_base)
-         if os.path.isdir(os.path.join(output_base, d)) and d.startswith(prefix)],
-        reverse=True
-    )
-    for subdir in subdirs:
-        candidate = os.path.join(output_base, subdir, "test_info.json")
+    for train_dir in _list_output_dirs(mode):
+        candidate = os.path.join(train_dir, "test_info.json")
         if os.path.exists(candidate):
             return candidate
     return None

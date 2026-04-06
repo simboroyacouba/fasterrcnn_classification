@@ -108,21 +108,25 @@ def load_model(model_path, device):
 
 
 def find_best_model(mode):
-    """Chercher automatiquement dans output/fasterrcnn_{mode}_* (plus récent en premier)."""
-    output_base = "output"
-    if not os.path.exists(output_base):
-        return None
-    prefix = f"fasterrcnn_{mode}_"
-    subdirs = sorted(
-        [d for d in os.listdir(output_base)
-         if os.path.isdir(os.path.join(output_base, d)) and d.startswith(prefix)],
-        reverse=True
-    )
-    for subdir in subdirs:
-        for fname in ["best_model.pth", "best.pth"]:
-            candidate = os.path.join(output_base, subdir, fname)
-            if os.path.exists(candidate):
-                return candidate
+    """Chercher automatiquement le modele le plus recent pour le mode donne."""
+    for base in [os.getenv("OUTPUT_DIR", "./output"), "./runs/detect/train"]:
+        if not os.path.exists(base):
+            continue
+        if mode != "all":
+            prefix = f"fasterrcnn_{mode}_"
+            dirs = [d for d in os.listdir(base)
+                    if os.path.isdir(os.path.join(base, d)) and d.startswith(prefix)]
+        else:
+            dirs = [d for d in os.listdir(base)
+                    if os.path.isdir(os.path.join(base, d))
+                    and d.startswith("fasterrcnn_")
+                    and not d.startswith("fasterrcnn_nadir_")
+                    and not d.startswith("fasterrcnn_oblique_")]
+        for subdir in sorted(dirs, reverse=True):
+            for fname in ["best_model.pth", "best.pth"]:
+                candidate = os.path.join(base, subdir, fname)
+                if os.path.exists(candidate):
+                    return candidate
     return None
 
 

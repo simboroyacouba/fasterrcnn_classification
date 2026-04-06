@@ -67,38 +67,38 @@ def load_classes(yaml_path):
     return classes
 
 
+def _list_output_dirs(mode):
+    candidates = []
+    for base in [os.getenv("OUTPUT_DIR", "./output"), "./runs/detect/train"]:
+        if not os.path.exists(base):
+            continue
+        if mode != "all":
+            prefix = f"fasterrcnn_{mode}_"
+            dirs = [d for d in os.listdir(base)
+                    if os.path.isdir(os.path.join(base, d)) and d.startswith(prefix)]
+        else:
+            dirs = [d for d in os.listdir(base)
+                    if os.path.isdir(os.path.join(base, d))
+                    and d.startswith("fasterrcnn_")
+                    and not d.startswith("fasterrcnn_nadir_")
+                    and not d.startswith("fasterrcnn_oblique_")]
+        for d in sorted(dirs, reverse=True):
+            candidates.append(os.path.join(base, d))
+    return candidates
+
+
 def find_best_model(mode):
-    """Chercher dans output/fasterrcnn_{mode}_* le modele le plus recent."""
-    output_base = "output"
-    if not os.path.exists(output_base):
-        return None
-    prefix = f"fasterrcnn_{mode}_"
-    subdirs = sorted(
-        [d for d in os.listdir(output_base)
-         if os.path.isdir(os.path.join(output_base, d)) and d.startswith(prefix)],
-        reverse=True
-    )
-    for subdir in subdirs:
+    for train_dir in _list_output_dirs(mode):
         for fname in ["best_model.pth", "best.pth"]:
-            candidate = os.path.join(output_base, subdir, fname)
+            candidate = os.path.join(train_dir, fname)
             if os.path.exists(candidate):
                 return candidate
     return None
 
 
 def find_test_info(mode):
-    """Chercher test_info.json dans output/fasterrcnn_{mode}_*."""
-    output_base = "output"
-    if not os.path.exists(output_base):
-        return None
-    prefix = f"fasterrcnn_{mode}_"
-    subdirs = sorted(
-        [d for d in os.listdir(output_base)
-         if os.path.isdir(os.path.join(output_base, d)) and d.startswith(prefix)],
-        reverse=True
-    )
-    for subdir in subdirs:
-        candidate = os.path.join(output_base, subdir, "test_info.json")
+    for train_dir in _list_output_dirs(mode):
+        candidate = os.path.join(train_dir, "test_info.json")
         if os.path.exists(candidate):
             return candidate
     return None

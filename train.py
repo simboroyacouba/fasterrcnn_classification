@@ -219,17 +219,11 @@ def augment_sample(image, boxes, labels, image_size):
         image = TF.vflip(image)
         boxes = [[x1, H - y2, x2, H - y1] for x1, y1, x2, y2 in boxes]
 
-    # Rotation 90° / 180° / 270° (images aériennes : toutes orientations valides)
-    angle = random.choice([0, 90, 180, 270])
-    if angle == 90:
-        image = TF.rotate(image, 90, expand=False)
-        boxes = [[y1, W - x2, y2, W - x1] for x1, y1, x2, y2 in boxes]
-    elif angle == 180:
+    # Rotation 180° uniquement (valide nadir ET oblique)
+    # Les rotations 90/270 sont invalides pour les images obliques (perspective incorrecte)
+    if random.random() < 0.5:
         image = TF.rotate(image, 180, expand=False)
         boxes = [[W - x2, H - y2, W - x1, H - y1] for x1, y1, x2, y2 in boxes]
-    elif angle == 270:
-        image = TF.rotate(image, 270, expand=False)
-        boxes = [[H - y2, x1, H - y1, x2] for x1, y1, x2, y2 in boxes]
 
     # Clamp et filtrer les boxes dégénérées (label suivi par index)
     kept = [
