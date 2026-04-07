@@ -483,6 +483,10 @@ def train_fasterrcnn():
         "--mode", choices=["nadir", "oblique", "all"], default="all",
         help="nadir=Production_*.png / oblique=Snapshot_*.jpg / all=dataset complet"
     )
+    parser.add_argument("--images-dir",       default=None, help="Surcharge DETECTION_DATASET_IMAGES_DIR")
+    parser.add_argument("--annotations-file", default=None, help="Surcharge le fichier annotations COCO (.json)")
+    parser.add_argument("--classes-file",     default=None, help="Surcharge le fichier de classes (.yaml)")
+    parser.add_argument("--output-dir",       default=None, help="Surcharge OUTPUT_DIR")
     args = parser.parse_args()
     mode = args.mode
 
@@ -496,6 +500,16 @@ def train_fasterrcnn():
             CONFIG["annotations_file"] = CONFIG["oblique_annotations_file"]
         CONFIG["classes_file"] = CONFIG["oblique_classes_file"]
         # rare_class_weights inchangé (batiment_peint ×3, etc.)
+
+    # Surcharges CLI (priorite maximale, apres le mode)
+    if args.images_dir:
+        CONFIG["images_dir"] = args.images_dir
+    if args.annotations_file:
+        CONFIG["annotations_file"] = args.annotations_file
+    if args.classes_file:
+        CONFIG["classes_file"] = args.classes_file
+    if args.output_dir:
+        CONFIG["output_dir"] = args.output_dir
 
     CONFIG["classes"] = load_classes(CONFIG["classes_file"])
     num_classes = len(CONFIG["classes"])  # inclut __background__
