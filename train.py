@@ -81,9 +81,9 @@ CONFIG = {
 
     # Poids de sur-échantillonnage par classe (prend le max si plusieurs classes rares sur la même image)
     "rare_class_weights": {
-        "batiment_peint":      3.0,
+        "batiment_peint":      5.0,   # P=0.467 très faible → surrepresenter fortement
         "batiment_non_enduit": 2.0,
-        "batiment_enduit":     1.5,
+        "batiment_enduit":     2.5,   # P=0.512 faible → augmenter aussi
     },
 
     # Chemins spécifiques par mode (surchargent annotations_file et classes_file)

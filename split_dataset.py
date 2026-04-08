@@ -38,7 +38,9 @@ DEFAULT_OUTPUT = os.getenv(
 )
 
 NADIR_CLASSES   = {"panneau_solaire"}
-OBLIQUE_CLASSES = {"panneau_solaire", "batiment_peint", "batiment_non_enduit", "batiment_enduit"}
+OBLIQUE_CLASSES = {"batiment_peint", "batiment_non_enduit", "batiment_enduit"}
+# panneau_solaire retiré du modèle oblique : trop de faux positifs (P=0.40),
+# le modèle nadir le détecte bien mieux (P=0.90)
 
 # Règle de séparation par préfixe de nom de fichier
 def get_view_type(file_name):
