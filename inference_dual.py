@@ -47,6 +47,15 @@ SCORE_THRESHOLD = float(os.getenv("SCORE_THRESHOLD", "0.5"))
 IMAGE_SIZE      = int(os.getenv("IMAGE_SIZE", "640"))
 NMS_THRESHOLD   = float(os.getenv("NMS_THRESHOLD", "0.5"))
 
+# Seuils par classe (surcharge SCORE_THRESHOLD pour les classes a faible precision)
+# Ajuster apres evaluation sur le val set pour maximiser F1 par classe
+CLASS_THRESHOLDS = {
+    "panneau_solaire":    float(os.getenv("THRESH_PANNEAU_SOLAIRE",    "0.60")),
+    "batiment_peint":     float(os.getenv("THRESH_BATIMENT_PEINT",     "0.70")),
+    "batiment_non_enduit":float(os.getenv("THRESH_BATIMENT_NON_ENDUIT","0.55")),
+    "batiment_enduit":    float(os.getenv("THRESH_BATIMENT_ENDUIT",    "0.65")),
+}
+
 COLORS = {
     "panneau_solaire":    (255, 0,   0),
     "batiment_peint":     (0,   255, 0),
@@ -149,11 +158,27 @@ def predict(model, image_path, classes, device, threshold=0.5, image_size=640):
     inf_time = time.time() - t0
 
     output = outputs[0]
-    keep   = output["scores"] >= threshold
 
-    boxes  = output["boxes"][keep].cpu().numpy()
-    labels = output["labels"][keep].cpu().numpy()
-    scores = output["scores"][keep].cpu().numpy()
+    all_boxes  = output["boxes"].cpu().numpy()
+    all_labels = output["labels"].cpu().numpy()
+    all_scores = output["scores"].cpu().numpy()
+
+    # Seuil global d'abord, puis seuil par classe si disponible
+    kept = []
+    for i, (lbl, score) in enumerate(zip(all_labels, all_scores)):
+        cname = classes[int(lbl)] if int(lbl) < len(classes) else "unknown"
+        thr = CLASS_THRESHOLDS.get(cname, threshold)
+        if score >= thr:
+            kept.append(i)
+
+    if kept:
+        boxes  = all_boxes[kept]
+        labels = all_labels[kept]
+        scores = all_scores[kept]
+    else:
+        boxes  = np.zeros((0, 4), dtype=np.float32)
+        labels = np.array([], dtype=np.int64)
+        scores = np.array([], dtype=np.float32)
 
     # Rescaler vers dimensions originales
     if len(boxes) > 0:

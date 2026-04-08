@@ -487,6 +487,8 @@ def train_fasterrcnn():
     parser.add_argument("--annotations-file", default=None, help="Surcharge le fichier annotations COCO (.json)")
     parser.add_argument("--classes-file",     default=None, help="Surcharge le fichier de classes (.yaml)")
     parser.add_argument("--output-dir",       default=None, help="Surcharge OUTPUT_DIR")
+    parser.add_argument("--freeze-epochs",    type=int, default=0,
+                        help="Nombre d'epochs avec backbone gele (staged training). 0=desactive.")
     args = parser.parse_args()
     mode = args.mode
 
@@ -510,6 +512,8 @@ def train_fasterrcnn():
         CONFIG["classes_file"] = args.classes_file
     if args.output_dir:
         CONFIG["output_dir"] = args.output_dir
+
+    freeze_epochs = args.freeze_epochs
 
     CONFIG["classes"] = load_classes(CONFIG["classes_file"])
     num_classes = len(CONFIG["classes"])  # inclut __background__
@@ -587,6 +591,12 @@ def train_fasterrcnn():
     model = build_model(num_classes, pretrained=CONFIG["pretrained"])
     model.to(device)
 
+    if freeze_epochs > 0:
+        print(f"   Staged training : backbone gele pour les {freeze_epochs} premieres epochs")
+        for name, param in model.named_parameters():
+            if "backbone" in name:
+                param.requires_grad = False
+
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(params,
                                 lr=CONFIG["learning_rate"],
@@ -614,6 +624,19 @@ def train_fasterrcnn():
     for epoch in range(1, CONFIG["num_epochs"] + 1):
         epoch_start = time.time()
         print(f"\n📅 Epoch [{epoch}/{CONFIG['num_epochs']}]")
+
+        # Degel du backbone apres freeze_epochs
+        if freeze_epochs > 0 and epoch == freeze_epochs + 1:
+            print(f"   --> Degel du backbone (epoch {epoch}), LR divise par 5")
+            for param in model.parameters():
+                param.requires_grad = True
+            # Reconstruire l'optimizer avec tous les parametres et LR reduit
+            new_lr = CONFIG["learning_rate"] / 5.0
+            optimizer = torch.optim.SGD(
+                [p for p in model.parameters() if p.requires_grad],
+                lr=new_lr, momentum=CONFIG["momentum"], weight_decay=CONFIG["weight_decay"]
+            )
+            lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
 
         current_lr = optimizer.param_groups[0]['lr']
         avg_loss, losses_dict = train_one_epoch(model, optimizer, train_loader, device, epoch, CONFIG["num_epochs"])
