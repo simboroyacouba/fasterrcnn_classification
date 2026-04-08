@@ -2,15 +2,10 @@
 
 classes:
 - __background__
-- panneau_solaire
 - batiment_peint
 - batiment_non_enduit
 - batiment_enduit
 colors:
-  panneau_solaire:
-  - 255
-  - 0
-  - 0
   batiment_peint:
   - 0
   - 255
@@ -24,7 +19,6 @@ colors:
   - 165
   - 0
 descriptions:
-  panneau_solaire: Tôle ondulée métallique
   batiment_peint: Tôle bac acier
   batiment_non_enduit: Tuiles en terre cuite ou béton
   batiment_enduit: Dalle béton (toit plat)
