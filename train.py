@@ -602,7 +602,11 @@ def train_fasterrcnn():
                                 lr=CONFIG["learning_rate"],
                                 momentum=CONFIG["momentum"],
                                 weight_decay=CONFIG["weight_decay"])
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+    # CosineAnnealingLR : LR decroit progressivement jusqu'a eta_min sur toute la duree
+    # Evite le StepLR qui coupe trop fort le LR des epoch 15-20
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=CONFIG["num_epochs"], eta_min=1e-5
+    )
 
     # -------------------------------------------------------------------------
     # Boucle d'entraînement
@@ -636,7 +640,9 @@ def train_fasterrcnn():
                 [p for p in model.parameters() if p.requires_grad],
                 lr=new_lr, momentum=CONFIG["momentum"], weight_decay=CONFIG["weight_decay"]
             )
-            lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+            lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=CONFIG["num_epochs"] - freeze_epochs, eta_min=1e-5
+            )
 
         current_lr = optimizer.param_groups[0]['lr']
         avg_loss, losses_dict = train_one_epoch(model, optimizer, train_loader, device, epoch, CONFIG["num_epochs"])
