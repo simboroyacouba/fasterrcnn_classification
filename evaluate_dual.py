@@ -1,11 +1,7 @@
 """
-evaluate_dual.py
+evaluate_dual.py — FasterRCNN
 Evalue les modeles nadir et oblique separement puis genere un rapport combine.
-
-Logique :
-  - Modele NADIR   : evalue sur le test set nadir  (panneau_solaire)
-  - Modele OBLIQUE : evalue sur le test set oblique (4 classes)
-  - COMBINE        : fusionne les TP/FP/FN des deux evaluations par classe
+Metriques et structure JSON conformes au script YOLO de reference.
 
 Usage :
     python evaluate_dual.py
@@ -17,6 +13,7 @@ Usage :
 import os
 import json
 import yaml
+import time
 import argparse
 import numpy as np
 import torch
@@ -51,6 +48,10 @@ OUTPUT_BASE     = os.getenv("EVALUATION_DIR", "./evaluation")
 
 NADIR_CLASSES_FILE   = os.getenv("NADIR_CLASSES_FILE",   "classes_nadir.yaml")
 OBLIQUE_CLASSES_FILE = os.getenv("OBLIQUE_CLASSES_FILE", "classes_oblique.yaml")
+
+NADIR_CLASSES   = ["panneau_solaire"]
+OBLIQUE_CLASSES = ["batiment_peint", "batiment_non_enduit", "batiment_enduit"]
+ALL_CLASSES     = NADIR_CLASSES + OBLIQUE_CLASSES
 
 
 # =============================================================================
@@ -205,100 +206,142 @@ def calculate_iou(box1, box2):
 
 
 class MetricsCalculator:
-    """Calcule TP/FP/FN par classe et par seuil IoU."""
+    """
+    Calcule AP (aire sous courbe P/R) par classe et par seuil IoU.
+    Stocke toutes les detections avec leurs scores pour un AP correct.
+    Precision/Recall/F1 sont calcules au seuil de score fixe.
+    """
 
     def __init__(self, class_names, iou_thresholds):
         self.class_names    = [c for c in class_names if c != '__background__']
         self.iou_thresholds = iou_thresholds
-        self.tp  = defaultdict(lambda: defaultdict(int))
-        self.fp  = defaultdict(lambda: defaultdict(int))
-        self.fn  = defaultdict(lambda: defaultdict(int))
+        # Per (class, iou_thresh) : liste de (score, is_tp)
+        self.det_records = {
+            name: {t: [] for t in iou_thresholds}
+            for name in self.class_names
+        }
+        # Nombre total de GT par classe (denominateur du recall)
+        self.n_gt = {name: 0 for name in self.class_names}
 
     def add_image(self, pred_boxes, pred_labels, pred_scores, gt_boxes, gt_labels):
+        # Comptage des GT (une fois par image, independant du seuil IoU)
+        for class_id, name in enumerate(self.class_names, start=1):
+            self.n_gt[name] += int((gt_labels == class_id).sum())
+
+        # Appariement predictions / GT a chaque seuil IoU
         for iou_thresh in self.iou_thresholds:
             for class_id, name in enumerate(self.class_names, start=1):
                 p_mask = pred_labels == class_id
                 g_mask = gt_labels   == class_id
-                p_b = pred_boxes[p_mask]; p_s = pred_scores[p_mask]
+                p_b = pred_boxes[p_mask]
+                p_s = pred_scores[p_mask]
                 g_b = gt_boxes[g_mask]
 
-                if len(g_b) == 0 and len(p_b) == 0:
-                    continue
-                if len(g_b) == 0:
-                    self.fp[name][iou_thresh] += len(p_b); continue
                 if len(p_b) == 0:
-                    self.fn[name][iou_thresh] += len(g_b); continue
+                    continue
+
+                if len(g_b) == 0:
+                    for s in p_s:
+                        self.det_records[name][iou_thresh].append((float(s), False))
+                    continue
 
                 iou_mat = np.array([[calculate_iou(p, g) for g in g_b] for p in p_b])
-                matched = set()
+                matched_gt = set()
                 for i in np.argsort(-p_s):
-                    best_j = -1
+                    best_j = -1; best_iou = -1.0
                     for j in range(len(g_b)):
-                        if j not in matched and iou_mat[i, j] >= iou_thresh:
-                            if best_j < 0 or iou_mat[i, j] > iou_mat[i, best_j]:
-                                best_j = j
+                        if j not in matched_gt and iou_mat[i, j] >= iou_thresh:
+                            if iou_mat[i, j] > best_iou:
+                                best_iou = iou_mat[i, j]; best_j = j
                     if best_j >= 0:
-                        matched.add(best_j)
-                        self.tp[name][iou_thresh] += 1
+                        matched_gt.add(best_j)
+                        self.det_records[name][iou_thresh].append((float(p_s[i]), True))
                     else:
-                        self.fp[name][iou_thresh] += 1
-                self.fn[name][iou_thresh] += len(g_b) - len(matched)
+                        self.det_records[name][iou_thresh].append((float(p_s[i]), False))
+
+    def _compute_ap(self, records, n_gt):
+        """AP via interpolation all-points (aire sous courbe P/R)."""
+        if n_gt == 0 or not records:
+            return 0.0
+        records_sorted = sorted(records, key=lambda x: -x[0])
+        tp_cum = 0; fp_cum = 0
+        ap = 0.0; prev_r = 0.0
+        for _, is_tp in records_sorted:
+            if is_tp:
+                tp_cum += 1
+            else:
+                fp_cum += 1
+            p = tp_cum / (tp_cum + fp_cum)
+            r = tp_cum / n_gt
+            if r > prev_r:
+                ap += (r - prev_r) * p
+                prev_r = r
+        return float(ap)
 
     def merge(self, other):
         """Fusionne les compteurs d'un autre MetricsCalculator dans celui-ci."""
         for name in other.class_names:
             if name not in self.class_names:
                 self.class_names.append(name)
-            for t in other.iou_thresholds:
-                self.tp[name][t] += other.tp[name][t]
-                self.fp[name][t] += other.fp[name][t]
-                self.fn[name][t] += other.fn[name][t]
+                self.n_gt[name] = 0
+                self.det_records[name] = {t: [] for t in self.iou_thresholds}
+            self.n_gt[name] += other.n_gt[name]
+            for t in self.iou_thresholds:
+                self.det_records[name][t].extend(other.det_records[name].get(t, []))
 
-    def compute(self):
-        results = {'per_class': {}, 'overall': {}}
+    def compute(self, score_threshold=0.5):
+        """
+        Retourne un dict avec :
+          mAP50, mAP50_95, precision, recall, f1_score,
+          per_class_AP50, per_class_precision, per_class_recall, per_class_f1
+        """
+        per_class_AP50      = {}
+        per_class_ap50_95   = {}
+        per_class_precision = {}
+        per_class_recall    = {}
+        per_class_f1        = {}
 
         for name in self.class_names:
-            results['per_class'][name] = {}
-            for t in self.iou_thresholds:
-                tp = self.tp[name][t]; fp = self.fp[name][t]; fn = self.fn[name][t]
-                p  = tp / (tp + fp) if tp + fp > 0 else 0
-                r  = tp / (tp + fn) if tp + fn > 0 else 0
-                results['per_class'][name][f'iou_{t}'] = {
-                    'TP': tp, 'FP': fp, 'FN': fn,
-                    'Precision': p, 'Recall': r,
-                    'F1': 2*p*r / (p+r) if p+r > 0 else 0
-                }
+            n_gt = self.n_gt[name]
 
-        for t in self.iou_thresholds:
-            tp = sum(self.tp[n][t] for n in self.class_names)
-            fp = sum(self.fp[n][t] for n in self.class_names)
-            fn = sum(self.fn[n][t] for n in self.class_names)
-            p  = tp / (tp + fp) if tp + fp > 0 else 0
-            r  = tp / (tp + fn) if tp + fn > 0 else 0
-            results['overall'][f'iou_{t}'] = {
-                'TP': tp, 'FP': fp, 'FN': fn,
-                'Precision': p, 'Recall': r,
-                'F1': 2*p*r / (p+r) if p+r > 0 else 0
-            }
+            # AP par seuil IoU -> AP50 et AP50:95
+            aps = [self._compute_ap(self.det_records[name][t], n_gt)
+                   for t in self.iou_thresholds]
+            per_class_AP50[name]    = aps[0]   # IoU = 0.5
+            per_class_ap50_95[name] = float(np.mean(aps))
 
-        results['mAP50']    = np.mean([
-            results['per_class'][n]['iou_0.5']['Precision'] for n in self.class_names
-        ])
-        results['mAP50_95'] = np.mean([
-            np.mean([results['per_class'][n][f'iou_{t}']['Precision'] for t in self.iou_thresholds])
-            for n in self.class_names
-        ])
-        results['mAP_per_class'] = {
-            name: {
-                'AP50':    results['per_class'][name]['iou_0.5']['Precision'],
-                'AP50_95': float(np.mean([
-                    results['per_class'][name][f'iou_{t}']['Precision']
-                    for t in self.iou_thresholds
-                ]))
-            }
-            for name in self.class_names
+            # Precision / Recall / F1 au seuil de score fixe (IoU = 0.5)
+            records_50 = self.det_records[name][0.5]
+            tp = sum(1 for s, is_tp in records_50 if s >= score_threshold and is_tp)
+            fp = sum(1 for s, is_tp in records_50 if s >= score_threshold and not is_tp)
+            fn = max(0, n_gt - tp)
+
+            p  = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            r  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+
+            per_class_precision[name] = p
+            per_class_recall[name]    = r
+            per_class_f1[name]        = f1
+
+        # Metriques globales (moyenne macro sur les classes)
+        mAP50    = float(np.mean(list(per_class_AP50.values())))    if per_class_AP50    else 0.0
+        mAP50_95 = float(np.mean(list(per_class_ap50_95.values()))) if per_class_ap50_95 else 0.0
+        precision = float(np.mean(list(per_class_precision.values()))) if per_class_precision else 0.0
+        recall    = float(np.mean(list(per_class_recall.values())))    if per_class_recall    else 0.0
+        f1_score  = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+        return {
+            'mAP50':               mAP50,
+            'mAP50_95':            mAP50_95,
+            'precision':           precision,
+            'recall':              recall,
+            'f1_score':            f1_score,
+            'per_class_AP50':      per_class_AP50,
+            'per_class_precision': per_class_precision,
+            'per_class_recall':    per_class_recall,
+            'per_class_f1':        per_class_f1,
         }
-        return results
 
 
 # =============================================================================
@@ -308,7 +351,9 @@ class MetricsCalculator:
 def run_evaluation(model, test_info_path, classes, device, score_threshold, image_size):
     """
     Lance l'evaluation sur le test set decrit par test_info.json.
-    Retourne un MetricsCalculator rempli et le nombre d'images testees.
+    Retourne (MetricsCalculator, n_images, inference_ms_moyen).
+    Toutes les predictions (sans filtrage par score) sont passees au calculateur
+    pour un calcul correct de l'AP. Le seuil de score est applique dans compute().
     """
     with open(test_info_path, 'r') as f:
         test_info = json.load(f)
@@ -321,158 +366,335 @@ def run_evaluation(model, test_info_path, classes, device, score_threshold, imag
     dataset = TestDataset(images_dir, annotations_file, test_image_ids, cat_mapping, image_size)
     loader  = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_fn, num_workers=0)
 
-    calc = MetricsCalculator(classes, IOu_THRESHOLDS)
+    calc            = MetricsCalculator(classes, IOu_THRESHOLDS)
+    inference_times = []
 
     model.eval()
     with torch.no_grad():
         for images, targets in tqdm(loader, desc="   Evaluation", leave=False):
-            images = [img.to(device) for img in images]
-            outputs = model(images)
+            images_dev = [img.to(device) for img in images]
+
+            # Chronometrage image par image avec synchronisation CUDA
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+            outputs = model(images_dev)
+
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            t1 = time.perf_counter()
+
+            inference_times.append((t1 - t0) * 1000.0)  # ms
 
             for output, target in zip(outputs, targets):
-                keep = output['scores'].cpu() >= score_threshold
-                pred_boxes  = output['boxes'].cpu().numpy()[keep.numpy()]
-                pred_labels = output['labels'].cpu().numpy()[keep.numpy()]
-                pred_scores = output['scores'].cpu().numpy()[keep.numpy()]
+                # Pas de filtrage par score ici : le calculateur stocke tout
+                pred_boxes  = output['boxes'].cpu().numpy()
+                pred_labels = output['labels'].cpu().numpy()
+                pred_scores = output['scores'].cpu().numpy()
                 gt_boxes    = target['boxes'].numpy()
                 gt_labels   = target['labels'].numpy()
                 calc.add_image(pred_boxes, pred_labels, pred_scores, gt_boxes, gt_labels)
 
-    return calc, len(test_image_ids)
+    inference_ms = float(np.mean(inference_times)) if inference_times else None
+    return calc, len(test_image_ids), inference_ms
 
 
-# =============================================================================
-# AFFICHAGE ET GRAPHIQUES
-# =============================================================================
+def evaluate_model(model_path, test_info_path, classes, mode, output_dir, device,
+                   score_threshold, image_size):
+    """
+    Charge le modele, evalue sur le test set et retourne un dict de metriques
+    conforme au format YOLO. Sauvegarde metrics_{mode}.json dans output_dir.
+    """
+    print(f"\n{'='*65}")
+    print(f"   Evaluation : {mode.upper()}")
+    print(f"{'='*65}")
 
-def print_results(label, results, n_images):
-    w = 70
-    print("\n" + "=" * w)
-    print(f"   {label}")
-    print("=" * w)
-    print(f"   Images testees : {n_images}")
-    print(f"   mAP@50         : {results['mAP50']:.4f}  ({results['mAP50']*100:.2f}%)")
-    print(f"   mAP@50:95      : {results['mAP50_95']:.4f}")
-    print(f"   Precision      : {results['overall']['iou_0.5']['Precision']:.4f}")
-    print(f"   Recall         : {results['overall']['iou_0.5']['Recall']:.4f}")
-    print(f"   F1-Score       : {results['overall']['iou_0.5']['F1']:.4f}")
-    print("-" * w)
-    print(f"   {'Classe':<28} {'P':>7} {'R':>7} {'F1':>7} {'AP@50':>8} {'AP@50:95':>10}")
-    print("-" * w)
-    for name in results['mAP_per_class']:
-        m   = results['per_class'][name]['iou_0.5']
-        ap  = results['mAP_per_class'][name]
-        print(f"   {name:<28} {m['Precision']:>7.3f} {m['Recall']:>7.3f} {m['F1']:>7.3f}"
-              f" {ap['AP50']:>8.3f} {ap['AP50_95']:>10.3f}")
-    print("=" * w)
+    if not model_path or not os.path.exists(model_path):
+        print(f"   Modele non trouve : {model_path}")
+        print(f"   Conseil : lancez  python train.py --mode {mode}")
+        return None
 
+    if not test_info_path or not os.path.exists(test_info_path):
+        print(f"   test_info.json non trouve : {test_info_path}")
+        print(f"   Conseil : lancez  python train.py --mode {mode}")
+        return None
 
-def plot_dual_results(nadir_res, oblique_res, combined_res, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
+    model, _, _ = load_model(model_path, device)
 
-    # --- Graphique 1 : AP@50 par classe pour chaque modele ---
-    all_classes = list(combined_res['mAP_per_class'].keys())
-    x = np.arange(len(all_classes))
-    w = 0.25
+    # Nombre de parametres en millions
+    params_M = sum(p.numel() for p in model.parameters()) / 1e6
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    print("\n   Evaluation sur le test set...")
+    calc, n_images, inference_ms = run_evaluation(
+        model, test_info_path, classes, device, score_threshold, image_size
+    )
+    fps_gpu  = (1000.0 / inference_ms) if inference_ms else None
+    computed = calc.compute(score_threshold=score_threshold)
 
-    # AP@50 par classe
-    nadir_ap   = [nadir_res['mAP_per_class'].get(c, {}).get('AP50', 0)    for c in all_classes]
-    oblique_ap = [oblique_res['mAP_per_class'].get(c, {}).get('AP50', 0)  for c in all_classes]
-    combined_ap= [combined_res['mAP_per_class'][c]['AP50']                 for c in all_classes]
-
-    axes[0].bar(x - w, nadir_ap,    w, label='Nadir',    color='steelblue',  alpha=0.8)
-    axes[0].bar(x,     oblique_ap,  w, label='Oblique',  color='darkorange', alpha=0.8)
-    axes[0].bar(x + w, combined_ap, w, label='Combine',  color='seagreen',   alpha=0.8)
-    axes[0].set_xticks(x)
-    axes[0].set_xticklabels(all_classes, rotation=30, ha='right', fontsize=9)
-    axes[0].set_ylim(0, 1)
-    axes[0].set_title('AP@50 par classe')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
-
-    # P/R/F1 combine
-    prec = [combined_res['per_class'][c]['iou_0.5']['Precision'] for c in all_classes]
-    rec  = [combined_res['per_class'][c]['iou_0.5']['Recall']    for c in all_classes]
-    f1   = [combined_res['per_class'][c]['iou_0.5']['F1']        for c in all_classes]
-
-    axes[1].bar(x - w, prec, w, label='Precision', color='steelblue',  alpha=0.8)
-    axes[1].bar(x,     rec,  w, label='Recall',    color='darkorange', alpha=0.8)
-    axes[1].bar(x + w, f1,   w, label='F1',        color='seagreen',   alpha=0.8)
-    axes[1].set_xticks(x)
-    axes[1].set_xticklabels(all_classes, rotation=30, ha='right', fontsize=9)
-    axes[1].set_ylim(0, 1)
-    axes[1].set_title('P / R / F1 combine (IoU=0.5)')
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'metrics_dual.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"   Graphique : {os.path.join(output_dir, 'metrics_dual.png')}")
-
-    # --- Graphique 2 : mAP@50 global comparatif ---
-    models  = ['Nadir', 'Oblique', 'Combine']
-    map50s  = [nadir_res['mAP50'], oblique_res['mAP50'], combined_res['mAP50']]
-    colors  = ['steelblue', 'darkorange', 'seagreen']
-
-    fig, ax = plt.subplots(figsize=(7, 5))
-    bars = ax.bar(models, map50s, color=colors, alpha=0.85, width=0.5)
-    for bar, val in zip(bars, map50s):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
-                f'{val*100:.1f}%', ha='center', va='bottom', fontsize=11, fontweight='bold')
-    ax.set_ylim(0, 1)
-    ax.set_ylabel('mAP@50')
-    ax.set_title('mAP@50 — Comparaison Nadir / Oblique / Combine')
-    ax.grid(True, alpha=0.3, axis='y')
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'map50_comparaison.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-
-
-def save_report(nadir_res, oblique_res, combined_res,
-                n_nadir, n_oblique, model_paths, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-
-    full = {
-        'timestamp':  datetime.now().isoformat(),
-        'models':     model_paths,
-        'nadir':      {'n_images': n_nadir,   **nadir_res},
-        'oblique':    {'n_images': n_oblique, **oblique_res},
-        'combined':   {'n_images': n_nadir + n_oblique, **combined_res},
+    metrics = {
+        "mode":                mode,
+        "model":               model_path,
+        "mAP50":               computed['mAP50'],
+        "mAP50_95":            computed['mAP50_95'],
+        "precision":           computed['precision'],
+        "recall":              computed['recall'],
+        "f1_score":            computed['f1_score'],
+        "inference_ms":        inference_ms,
+        "fps_gpu":             fps_gpu,
+        "params_M":            params_M,
+        "per_class_AP50":      computed['per_class_AP50'],
+        "per_class_precision": computed['per_class_precision'],
+        "per_class_recall":    computed['per_class_recall'],
+        "per_class_f1":        computed['per_class_f1'],
+        "evaluated_at":        datetime.now().isoformat(),
     }
-    json_path = os.path.join(output_dir, 'metrics_dual.json')
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(full, f, indent=2, default=float)
 
-    txt_path = os.path.join(output_dir, 'report_dual.txt')
-    with open(txt_path, 'w', encoding='utf-8') as f:
-        f.write(f"EVALUATION DUALE Faster R-CNN - {datetime.now()}\n")
-        f.write("=" * 60 + "\n\n")
-        f.write(f"Modele nadir   : {model_paths.get('nadir', 'N/A')}\n")
-        f.write(f"Modele oblique : {model_paths.get('oblique', 'N/A')}\n\n")
+    # --- Tableau global ---
+    print(f"\n   {'Metrique':<32} {'Valeur':>10}")
+    print(f"   {'-'*44}")
+    print(f"   {'mAP@50':<32} {metrics['mAP50']:>10.4f}")
+    print(f"   {'mAP@50:95':<32} {metrics['mAP50_95']:>10.4f}")
+    print(f"   {'Precision':<32} {metrics['precision']:>10.4f}")
+    print(f"   {'Recall':<32} {metrics['recall']:>10.4f}")
+    print(f"   {'F1 Score':<32} {metrics['f1_score']:>10.4f}")
+    if inference_ms is not None:
+        print(f"   {'Vitesse Inference (ms) ↓':<32} {inference_ms:>10.2f}")
+    if fps_gpu is not None:
+        print(f"   {'FPS GPU':<32} {fps_gpu:>10.1f}")
+    print(f"   {'Parametres (M)':<32} {params_M:>10.2f}")
 
-        for label, res, n in [
-            ("NADIR",    nadir_res,    n_nadir),
-            ("OBLIQUE",  oblique_res,  n_oblique),
-            ("COMBINE",  combined_res, n_nadir + n_oblique),
+    # --- Tableau par classe ---
+    per_class_AP50      = computed['per_class_AP50']
+    per_class_precision = computed['per_class_precision']
+    per_class_recall    = computed['per_class_recall']
+    per_class_f1        = computed['per_class_f1']
+
+    if per_class_AP50:
+        print(f"\n   {'Classe':<25} {'AP@50':>7} {'Prec':>7} {'Recall':>7} {'F1':>7}  Statut")
+        print(f"   {'-'*62}")
+        for cls in sorted(per_class_AP50.keys()):
+            ap  = per_class_AP50.get(cls, float('nan'))
+            pc  = per_class_precision.get(cls, float('nan'))
+            rc  = per_class_recall.get(cls, float('nan'))
+            f1c = per_class_f1.get(cls, float('nan'))
+            status = "OK" if ap >= 0.5 else ("~" if ap >= 0.3 else "!!")
+            print(f"      {cls:<25} {ap:>7.4f} {pc:>7.4f} {rc:>7.4f} {f1c:>7.4f}  [{status}]")
+
+    # --- Sauvegarde metrics_{mode}.json ---
+    os.makedirs(output_dir, exist_ok=True)
+    metrics_path = os.path.join(output_dir, f"metrics_{mode}.json")
+    with open(metrics_path, 'w', encoding='utf-8') as f:
+        json.dump(metrics, f, indent=2, default=float)
+    print(f"\n   Metriques sauvegardees : {metrics_path}")
+
+    return metrics
+
+
+# =============================================================================
+# RAPPORT COMBINE
+# =============================================================================
+
+def print_combined_report(nadir_metrics, oblique_metrics, output_dir):
+    """Affiche et sauvegarde le rapport combine (metrics_combined.json)."""
+
+    print("\n" + "=" * 65)
+    print("   RAPPORT COMBINE — Evaluation Duale FasterRCNN")
+    print("=" * 65)
+
+    # --- Tableau par classe ---
+    print(f"\n   {'Classe':<25} {'Modele':<10} {'AP@50':>7} {'Prec':>7} {'Recall':>7} {'F1':>7}  Statut")
+    print(f"   {'-'*72}")
+
+    all_results = {}
+    for m, model_name in [(nadir_metrics, "nadir"), (oblique_metrics, "oblique")]:
+        if m:
+            for cls, ap in m.get("per_class_AP50", {}).items():
+                all_results[cls] = {
+                    "ap":    ap,
+                    "prec":  m.get("per_class_precision", {}).get(cls, float('nan')),
+                    "rec":   m.get("per_class_recall",    {}).get(cls, float('nan')),
+                    "f1":    m.get("per_class_f1",        {}).get(cls, float('nan')),
+                    "model": model_name,
+                }
+
+    for cls in ALL_CLASSES:
+        if cls in all_results:
+            d      = all_results[cls]
+            status = "[OK]" if d["ap"] >= 0.5 else ("[~]" if d["ap"] >= 0.3 else "[!!]")
+            print(f"   {cls:<25} {d['model']:<10} {d['ap']:>7.4f} {d['prec']:>7.4f}"
+                  f" {d['rec']:>7.4f} {d['f1']:>7.4f}  {status}")
+        else:
+            print(f"   {cls:<25} {'N/A':<10} {'—':>7} {'—':>7} {'—':>7} {'—':>7}")
+
+    print(f"   {'-'*55}")
+
+    # --- Metriques globales par modele ---
+    for label, m in [("NADIR", nadir_metrics), ("OBLIQUE", oblique_metrics)]:
+        if m:
+            print(f"\n   [{label}]")
+            print(f"   mAP@50              : {m['mAP50']:.4f} ({m['mAP50'] * 100:.2f}%)")
+            print(f"   mAP@50:95           : {m['mAP50_95']:.4f}")
+            print(f"   Precision           : {m['precision']:.4f}")
+            print(f"   Recall              : {m['recall']:.4f}")
+            if m.get('f1_score') is not None:
+                print(f"   F1 Score            : {m['f1_score']:.4f}")
+            if m.get('inference_ms') is not None:
+                print(f"   Vitesse Inference   : {m['inference_ms']:.2f} ms ↓")
+            if m.get('fps_gpu') is not None:
+                print(f"   FPS GPU             : {m['fps_gpu']:.1f}")
+            if m.get('params_M') is not None:
+                print(f"   Parametres          : {m['params_M']:.2f} M")
+
+    # --- Moyennes globales combinees ---
+    available = [m for m in [nadir_metrics, oblique_metrics] if m]
+
+    def _mean(key):
+        vals = [m[key] for m in available if m.get(key) is not None]
+        return float(np.mean(vals)) if vals else None
+
+    mean_map    = _mean("mAP50")
+    mean_map95  = _mean("mAP50_95")
+    mean_prec   = _mean("precision")
+    mean_rec    = _mean("recall")
+    mean_f1     = _mean("f1_score")
+    mean_inf_ms = _mean("inference_ms")
+    mean_fps    = _mean("fps_gpu")
+    mean_params = _mean("params_M")
+
+    if mean_map is not None:
+        print(f"\n   {'Metrique combinee':<32} {'Valeur':>10}")
+        print(f"   {'-'*44}")
+        print(f"   {'mAP@50':<32} {mean_map:>10.4f}  ({mean_map*100:.2f}%)")
+        if mean_map95  is not None: print(f"   {'mAP@50:95':<32} {mean_map95:>10.4f}")
+        if mean_prec   is not None: print(f"   {'Precision':<32} {mean_prec:>10.4f}")
+        if mean_rec    is not None: print(f"   {'Recall':<32} {mean_rec:>10.4f}")
+        if mean_f1     is not None: print(f"   {'F1 Score':<32} {mean_f1:>10.4f}")
+        if mean_inf_ms is not None: print(f"   {'Vitesse Inference (ms) ↓':<32} {mean_inf_ms:>10.2f}")
+        if mean_fps    is not None: print(f"   {'FPS GPU':<32} {mean_fps:>10.1f}")
+        if mean_params is not None: print(f"   {'Parametres (M)':<32} {mean_params:>10.2f}")
+
+    print("=" * 65)
+
+    # --- Sauvegarde metrics_combined.json ---
+    combined = {
+        "timestamp": datetime.now().isoformat(),
+        "nadir":     nadir_metrics,
+        "oblique":   oblique_metrics,
+        "combined": {
+            "mAP50":        mean_map,
+            "mAP50_95":     mean_map95,
+            "precision":    mean_prec,
+            "recall":       mean_rec,
+            "f1_score":     mean_f1,
+            "inference_ms": mean_inf_ms,
+            "fps_gpu":      mean_fps,
+            "params_M":     mean_params,
+        },
+        "per_class": {
+            cls: all_results[cls] for cls in ALL_CLASSES if cls in all_results
+        },
+    }
+
+    os.makedirs(output_dir, exist_ok=True)
+    report_path = os.path.join(output_dir, "metrics_combined.json")
+    with open(report_path, 'w', encoding='utf-8') as f:
+        json.dump(combined, f, indent=2, default=float)
+    print(f"\n   Rapport combine : {report_path}")
+
+    return combined
+
+
+# =============================================================================
+# GRAPHIQUES
+# =============================================================================
+
+def plot_dual_results(nadir_metrics, oblique_metrics, output_dir):
+    """AP@50 par classe pour les deux modeles."""
+    os.makedirs(output_dir, exist_ok=True)
+
+    entries = []
+    for cls in ALL_CLASSES:
+        for metrics, model_name, color in [
+            (nadir_metrics,   "nadir",   "steelblue"),
+            (oblique_metrics, "oblique", "darkorange"),
         ]:
-            f.write(f"\n--- {label} ({n} images) ---\n")
-            f.write(f"mAP@50    : {res['mAP50']:.4f}\n")
-            f.write(f"mAP@50:95 : {res['mAP50_95']:.4f}\n")
-            f.write(f"Precision : {res['overall']['iou_0.5']['Precision']:.4f}\n")
-            f.write(f"Recall    : {res['overall']['iou_0.5']['Recall']:.4f}\n")
-            f.write(f"F1        : {res['overall']['iou_0.5']['F1']:.4f}\n")
-            f.write("Par classe :\n")
-            for name in res['mAP_per_class']:
-                m  = res['per_class'][name]['iou_0.5']
-                ap = res['mAP_per_class'][name]
-                f.write(f"  {name:<28} P={m['Precision']:.3f} R={m['Recall']:.3f}"
-                        f" F1={m['F1']:.3f} AP50={ap['AP50']:.3f}\n")
+            if metrics and cls in metrics.get("per_class_AP50", {}):
+                entries.append({
+                    "label": f"{cls}\n({model_name})",
+                    "ap":    metrics["per_class_AP50"][cls],
+                    "color": color,
+                })
 
-    print(f"   JSON   : {json_path}")
-    print(f"   Rapport: {txt_path}")
+    if not entries:
+        return
+
+    labels = [e["label"] for e in entries]
+    ap50s  = [e["ap"]    for e in entries]
+    colors = [e["color"] for e in entries]
+
+    fig, ax = plt.subplots(figsize=(max(8, len(entries) * 1.5), 6))
+    bars = ax.bar(range(len(labels)), ap50s, color=colors, edgecolor="white", linewidth=0.5)
+    for bar, ap in zip(bars, ap50s):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                f"{ap:.3f}", ha="center", va="bottom", fontsize=9)
+
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, fontsize=8)
+    ax.set_ylabel("AP@50")
+    ax.set_title("AP@50 par classe — Evaluation Duale FasterRCNN")
+    ax.set_ylim(0, 1.1)
+    ax.axhline(y=0.5, color="red",    linestyle="--", alpha=0.5, label="Seuil 0.5")
+    ax.axhline(y=0.3, color="orange", linestyle=":",  alpha=0.4, label="Seuil 0.3")
+    ax.grid(True, alpha=0.3, axis="y")
+    ax.legend(loc="upper right", fontsize=9)
+
+    plt.tight_layout()
+    out_path = os.path.join(output_dir, "metrics_dual.png")
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"   Graphique : {out_path}")
+
+
+def plot_global_comparison(nadir_metrics, oblique_metrics, output_dir):
+    """Metriques globales (mAP50, Precision, Recall) nadir vs oblique."""
+    available = {
+        k: v for k, v in [("nadir", nadir_metrics), ("oblique", oblique_metrics)]
+        if v is not None
+    }
+    if not available:
+        return
+
+    metric_keys   = ["mAP50", "mAP50_95", "precision", "recall"]
+    metric_labels = ["mAP@50", "mAP@50:95", "Precision", "Recall"]
+    colors        = {"nadir": "#2196F3", "oblique": "#FF9800"}
+
+    x     = np.arange(len(metric_keys))
+    width = 0.35
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    for i, (name, metrics) in enumerate(available.items()):
+        vals   = [metrics[k] for k in metric_keys]
+        offset = (i - (len(available) - 1) / 2) * width
+        bars   = ax.bar(x + offset, vals, width, label=f"Modele {name}",
+                        color=colors.get(name, "gray"), alpha=0.85)
+        for bar, v in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                    f"{v:.3f}", ha="center", va="bottom", fontsize=8)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(metric_labels)
+    ax.set_ylabel("Score")
+    ax.set_title("Metriques globales — Nadir vs Oblique")
+    ax.set_ylim(0, 1.15)
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis="y")
+
+    plt.tight_layout()
+    out_path = os.path.join(output_dir, "comparison_dual.png")
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"   Comparaison : {out_path}")
 
 
 # =============================================================================
@@ -480,14 +702,20 @@ def save_report(nadir_res, oblique_res, combined_res,
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluation duale nadir + oblique")
-    parser.add_argument("--nadir-model",   default=None)
-    parser.add_argument("--oblique-model", default=None)
+    parser = argparse.ArgumentParser(
+        description="Evaluation duale FasterRCNN — nadir + oblique",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--nadir-model",   default=None, help="Modele nadir (.pth)")
+    parser.add_argument("--oblique-model", default=None, help="Modele oblique (.pth)")
     parser.add_argument("--only", choices=["nadir", "oblique"], default=None,
                         help="Evaluer un seul modele (sans rapport combine)")
-    parser.add_argument("--output-dir", default=os.path.join(OUTPUT_BASE, "dual"))
-    parser.add_argument("--threshold",  type=float, default=SCORE_THRESHOLD)
-    parser.add_argument("--image-size", type=int,   default=IMAGE_SIZE)
+    parser.add_argument("--output-dir", default=os.path.join(OUTPUT_BASE, "dual"),
+                        help="Dossier de sortie")
+    parser.add_argument("--threshold",  type=float, default=SCORE_THRESHOLD,
+                        help="Seuil de score pour Precision/Recall/F1")
+    parser.add_argument("--image-size", type=int,   default=IMAGE_SIZE,
+                        help="Taille d'image pour le redimensionnement")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -500,95 +728,45 @@ def main():
     nadir_model_path   = args.nadir_model   or find_best_model("nadir")
     oblique_model_path = args.oblique_model or find_best_model("oblique")
 
-    # ------------------------------------------------------------------ NADIR
-    nadir_res = nadir_calc = None
-    n_nadir   = 0
+    print("=" * 65)
+    print("   EVALUATION DUALE FasterRCNN — Toitures Cadastrales")
+    print("=" * 65)
 
+    nadir_metrics   = None
+    oblique_metrics = None
+
+    # ------------------------------------------------------------------ NADIR
     if args.only in (None, "nadir"):
-        print("\n" + "=" * 70)
-        print("   EVALUATION NADIR")
-        print("=" * 70)
-        if nadir_model_path and os.path.exists(nadir_model_path):
-            nadir_model, _, _ = load_model(nadir_model_path, device)
-            nadir_test_info   = find_test_info("nadir")
-            if nadir_test_info:
-                nadir_calc, n_nadir = run_evaluation(
-                    nadir_model, nadir_test_info, nadir_classes,
-                    device, args.threshold, args.image_size
-                )
-                nadir_res = nadir_calc.compute()
-                print_results("NADIR - TEST SET", nadir_res, n_nadir)
-            else:
-                print("   test_info.json nadir introuvable. Lancez : python train.py --mode nadir")
-        else:
-            print("   Modele nadir introuvable. Lancez : python train.py --mode nadir")
+        nadir_test_info = find_test_info("nadir")
+        nadir_metrics = evaluate_model(
+            nadir_model_path, nadir_test_info, nadir_classes, "nadir",
+            args.output_dir, device, args.threshold, args.image_size,
+        )
 
     # --------------------------------------------------------------- OBLIQUE
-    oblique_res = oblique_calc = None
-    n_oblique   = 0
-
     if args.only in (None, "oblique"):
-        print("\n" + "=" * 70)
-        print("   EVALUATION OBLIQUE")
-        print("=" * 70)
-        if oblique_model_path and os.path.exists(oblique_model_path):
-            oblique_model, _, _ = load_model(oblique_model_path, device)
-            oblique_test_info   = find_test_info("oblique")
-            if oblique_test_info:
-                oblique_calc, n_oblique = run_evaluation(
-                    oblique_model, oblique_test_info, oblique_classes,
-                    device, args.threshold, args.image_size
-                )
-                oblique_res = oblique_calc.compute()
-                print_results("OBLIQUE - TEST SET", oblique_res, n_oblique)
-            else:
-                print("   test_info.json oblique introuvable. Lancez : python train.py --mode oblique")
-        else:
-            print("   Modele oblique introuvable. Lancez : python train.py --mode oblique")
+        oblique_test_info = find_test_info("oblique")
+        oblique_metrics = evaluate_model(
+            oblique_model_path, oblique_test_info, oblique_classes, "oblique",
+            args.output_dir, device, args.threshold, args.image_size,
+        )
 
     # --------------------------------------------------------------- COMBINE
-    if nadir_calc is not None and oblique_calc is not None:
-        print("\n" + "=" * 70)
-        print("   RAPPORT COMBINE")
-        print("=" * 70)
-
-        # Toutes les classes uniques dans l'ordre : nadir d'abord, puis oblique
-        all_class_names = list(nadir_classes)
-        for c in oblique_classes:
-            if c not in all_class_names:
-                all_class_names.append(c)
-
-        combined_calc = MetricsCalculator(all_class_names, IOu_THRESHOLDS)
-        combined_calc.merge(nadir_calc)
-        combined_calc.merge(oblique_calc)
-        combined_res = combined_calc.compute()
-
-        print_results("COMBINE (nadir + oblique)", combined_res, n_nadir + n_oblique)
-
-        plot_dual_results(nadir_res, oblique_res, combined_res, args.output_dir)
-        save_report(
-            nadir_res, oblique_res, combined_res,
-            n_nadir, n_oblique,
-            {'nadir': nadir_model_path, 'oblique': oblique_model_path},
-            args.output_dir
-        )
+    if nadir_metrics and oblique_metrics:
+        print_combined_report(nadir_metrics, oblique_metrics, args.output_dir)
+        plot_dual_results(nadir_metrics, oblique_metrics, args.output_dir)
+        plot_global_comparison(nadir_metrics, oblique_metrics, args.output_dir)
         print(f"\n   Resultats sauvegardes : {args.output_dir}")
 
-    elif nadir_res or oblique_res:
-        # Un seul modele : sauvegarder quand meme
-        res    = nadir_res   or oblique_res
-        calc   = nadir_calc  or oblique_calc
-        n      = n_nadir     or n_oblique
-        mode   = "nadir" if nadir_res else "oblique"
-        out    = os.path.join(args.output_dir, mode)
-        os.makedirs(out, exist_ok=True)
-        with open(os.path.join(out, f'metrics_{mode}.json'), 'w') as f:
-            json.dump({'n_images': n, **res}, f, indent=2, default=float)
-        print(f"\n   Resultats sauvegardes : {out}")
+    elif nadir_metrics or oblique_metrics:
+        plot_dual_results(nadir_metrics, oblique_metrics, args.output_dir)
+        print(f"\n   Resultats sauvegardes : {args.output_dir}")
 
     else:
         print("\n   Aucune evaluation effectuee.")
-        print("   Lancez d'abord : python train.py --mode nadir && python train.py --mode oblique")
+        print("   Lancez d'abord :")
+        print("      python train.py --mode nadir")
+        print("      python train.py --mode oblique")
 
 
 if __name__ == "__main__":
