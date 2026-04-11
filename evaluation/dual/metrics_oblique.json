@@ -1,0 +1,33 @@
+{
+  "mode": "oblique",
+  "model": "./runs/detect/train\\fasterrcnn_oblique_20260411_140456\\best_model.pth",
+  "mAP50": 0.6819344723435682,
+  "mAP50_95": 0.39761925127641445,
+  "precision": 0.5382273738438123,
+  "recall": 0.6482905982905983,
+  "f1_score": 0.5881541694272044,
+  "inference_ms": 1025.2856249688193,
+  "fps_gpu": 0.9753379698758692,
+  "params_M": 41.309411,
+  "per_class_AP50": {
+    "batiment_peint": 0.5370098039215686,
+    "batiment_non_enduit": 0.755869594416239,
+    "batiment_enduit": 0.7529240186928965
+  },
+  "per_class_precision": {
+    "batiment_peint": 0.3076923076923077,
+    "batiment_non_enduit": 0.717948717948718,
+    "batiment_enduit": 0.589041095890411
+  },
+  "per_class_recall": {
+    "batiment_peint": 0.4,
+    "batiment_non_enduit": 0.717948717948718,
+    "batiment_enduit": 0.8269230769230769
+  },
+  "per_class_f1": {
+    "batiment_peint": 0.34782608695652173,
+    "batiment_non_enduit": 0.717948717948718,
+    "batiment_enduit": 0.6880000000000001
+  },
+  "evaluated_at": "2026-04-11T17:40:53.866161"
+}
