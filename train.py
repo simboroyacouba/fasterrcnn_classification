@@ -545,8 +545,18 @@ def train_fasterrcnn():
     # -------------------------------------------------------------------------
     coco = COCO(CONFIG["annotations_file"])
     cat_ids = coco.getCatIds()
-    # Mapper: coco_cat_id -> index 1-based (0 est réservé à __background__)
-    cat_mapping = {cat_id: idx + 1 for idx, cat_id in enumerate(cat_ids)}
+    # Mapper: coco_cat_id -> index dans classes[] (0=__background__, 1=classe1, ...)
+    # On utilise le NOM de catégorie pour garantir la cohérence avec classes.yaml,
+    # quelle que soit l'ordre ou le nombre de catégories dans le JSON COCO.
+    coco_cats = {cat['id']: cat['name'] for cat in coco.loadCats(cat_ids)}
+    classes = CONFIG["classes"]
+    cat_mapping = {}
+    for cat_id, cat_name in coco_cats.items():
+        if cat_name in classes:
+            cat_mapping[cat_id] = classes.index(cat_name)
+        else:
+            print(f"   ⚠️  Catégorie COCO ignorée (absente du yaml): '{cat_name}' (id={cat_id})")
+    print(f"   cat_mapping: { {coco_cats[k]: v for k, v in cat_mapping.items()} }")
 
     train_ids, val_ids, test_ids, split_stats = stratified_split(
         coco, CONFIG["train_split"], CONFIG["val_split"], CONFIG["test_split"], seed=42
