@@ -81,9 +81,11 @@ CONFIG = {
 
     # Poids de sur-échantillonnage par classe (prend le max si plusieurs classes rares sur la même image)
     "rare_class_weights": {
-        "batiment_peint":      5.0,   # P=0.467 très faible → surrepresenter fortement
-        "batiment_non_enduit": 2.0,
-        "batiment_enduit":     2.5,   # P=0.512 faible → augmenter aussi
+        "menuiserie_metallique": 2.0,
+        "menuiserie_aluminium":  2.0,
+        "cloture_enduit":        2.0,
+        "cloture_non_enduit":    2.0,
+        "cloture_peinte":        2.0,
     },
 
     # Chemins spécifiques par mode (surchargent annotations_file et classes_file)
@@ -501,7 +503,7 @@ def train_fasterrcnn():
         if CONFIG["oblique_annotations_file"]:
             CONFIG["annotations_file"] = CONFIG["oblique_annotations_file"]
         CONFIG["classes_file"] = CONFIG["oblique_classes_file"]
-        # rare_class_weights inchangé (batiment_peint ×3, etc.)
+        # rare_class_weights inchangé (poids égaux 2.0 pour les 5 classes oblique)
 
     # Surcharges CLI (priorite maximale, apres le mode)
     if args.images_dir:

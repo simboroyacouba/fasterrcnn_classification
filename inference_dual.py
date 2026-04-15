@@ -50,17 +50,21 @@ NMS_THRESHOLD   = float(os.getenv("NMS_THRESHOLD", "0.5"))
 # Seuils par classe (surcharge SCORE_THRESHOLD pour les classes a faible precision)
 # Ajuster apres evaluation sur le val set pour maximiser F1 par classe
 CLASS_THRESHOLDS = {
-    "panneau_solaire":    float(os.getenv("THRESH_PANNEAU_SOLAIRE",    "0.60")),
-    "batiment_peint":     float(os.getenv("THRESH_BATIMENT_PEINT",     "0.70")),
-    "batiment_non_enduit":float(os.getenv("THRESH_BATIMENT_NON_ENDUIT","0.55")),
-    "batiment_enduit":    float(os.getenv("THRESH_BATIMENT_ENDUIT",    "0.65")),
+    "panneau_solaire":       float(os.getenv("THRESH_PANNEAU_SOLAIRE",       "0.60")),
+    "menuiserie_metallique": float(os.getenv("THRESH_MENUISERIE_METALLIQUE", "0.50")),
+    "menuiserie_aluminium":  float(os.getenv("THRESH_MENUISERIE_ALUMINIUM",  "0.50")),
+    "cloture_enduit":        float(os.getenv("THRESH_CLOTURE_ENDUIT",        "0.50")),
+    "cloture_non_enduit":    float(os.getenv("THRESH_CLOTURE_NON_ENDUIT",    "0.50")),
+    "cloture_peinte":        float(os.getenv("THRESH_CLOTURE_PEINTE",        "0.50")),
 }
 
 COLORS = {
-    "panneau_solaire":    (255, 0,   0),
-    "batiment_peint":     (0,   255, 0),
-    "batiment_non_enduit":(0,   0,   255),
-    "batiment_enduit":    (255, 165, 0),
+    "panneau_solaire":       (255, 0,   0),
+    "menuiserie_metallique": (128, 0,   128),
+    "menuiserie_aluminium":  (0,   200, 200),
+    "cloture_enduit":        (255, 100, 0),
+    "cloture_non_enduit":    (150, 75,  0),
+    "cloture_peinte":        (255, 0,   150),
 }
 
 MODEL_LABEL = {

@@ -50,7 +50,7 @@ NADIR_CLASSES_FILE   = os.getenv("NADIR_CLASSES_FILE",   "classes_nadir.yaml")
 OBLIQUE_CLASSES_FILE = os.getenv("OBLIQUE_CLASSES_FILE", "classes_oblique.yaml")
 
 NADIR_CLASSES   = ["panneau_solaire"]
-OBLIQUE_CLASSES = ["batiment_peint", "batiment_non_enduit", "batiment_enduit"]
+OBLIQUE_CLASSES = ["menuiserie_metallique", "menuiserie_aluminium", "cloture_enduit", "cloture_non_enduit", "cloture_peinte"]
 ALL_CLASSES     = NADIR_CLASSES + OBLIQUE_CLASSES
 
 

@@ -2,7 +2,7 @@
 split_dataset.py
 Sépare instances_default.json en deux sous-datasets COCO :
   - instances_nadir.json   : Production_*.png  → panneau_solaire uniquement
-  - instances_oblique.json : Snapshot_*.jpg    → toutes les classes (4)
+  - instances_oblique.json : Snapshot_*.jpg    → toutes les classes (5)
 
 Génère aussi classes_nadir.yaml et classes_oblique.yaml.
 
@@ -38,9 +38,7 @@ DEFAULT_OUTPUT = os.getenv(
 )
 
 NADIR_CLASSES   = {"panneau_solaire"}
-OBLIQUE_CLASSES = {"batiment_peint", "batiment_non_enduit", "batiment_enduit"}
-# panneau_solaire retiré du modèle oblique : trop de faux positifs (P=0.40),
-# le modèle nadir le détecte bien mieux (P=0.90)
+OBLIQUE_CLASSES = {"menuiserie_metallique", "menuiserie_aluminium", "cloture_enduit", "cloture_non_enduit", "cloture_peinte"}
 
 # Règle de séparation par préfixe de nom de fichier
 def get_view_type(file_name):
@@ -133,17 +131,21 @@ def split_coco(src_path, output_dir):
 # =============================================================================
 
 COLORS = {
-    "panneau_solaire":    [255, 0,   0],
-    "batiment_peint":     [0,   255, 0],
-    "batiment_non_enduit":[0,   0,   255],
-    "batiment_enduit":    [255, 165, 0],
+    "panneau_solaire":       [255, 0,   0],
+    "menuiserie_metallique": [128, 0,   128],
+    "menuiserie_aluminium":  [0,   200, 200],
+    "cloture_enduit":        [255, 100, 0],
+    "cloture_non_enduit":    [150, 75,  0],
+    "cloture_peinte":        [255, 0,   150],
 }
 
 DESCRIPTIONS = {
-    "panneau_solaire":    "Tôle ondulée métallique",
-    "batiment_peint":     "Tôle bac acier",
-    "batiment_non_enduit":"Tuiles en terre cuite ou béton",
-    "batiment_enduit":    "Dalle béton (toit plat)",
+    "panneau_solaire":       "Tôle ondulée métallique",
+    "menuiserie_metallique": "Menuiserie en métal (fer, acier, etc.)",
+    "menuiserie_aluminium":  "Menuiserie en aluminium",
+    "cloture_enduit":        "Clôture avec enduit",
+    "cloture_non_enduit":    "Clôture sans enduit",
+    "cloture_peinte":        "Clôture peinte",
 }
 
 def write_yaml(classes_list, path, comment):

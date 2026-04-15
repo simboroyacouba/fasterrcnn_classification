@@ -36,7 +36,7 @@ except ImportError:
 
 def load_classes(yaml_path="classes.yaml"):
     if not os.path.exists(yaml_path):
-        return ['__background__', 'panneau_solaire', 'batiment_peint', 'batiment_non_enduit', 'batiment_enduit']
+        return ['__background__', 'panneau_solaire', 'menuiserie_metallique', 'menuiserie_aluminium', 'cloture_enduit', 'cloture_non_enduit', 'cloture_peinte']
     with open(yaml_path, 'r', encoding='utf-8') as f:
         classes = yaml.safe_load(f).get('classes', [])
     if '__background__' not in classes:

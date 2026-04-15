@@ -34,7 +34,7 @@ except ImportError:
 
 def load_classes(yaml_path="classes.yaml"):
     if not os.path.exists(yaml_path):
-        return ['__background__', 'panneau_solaire', 'batiment_peint', 'batiment_non_enduit', 'batiment_enduit']
+        return ['__background__', 'panneau_solaire', 'menuiserie_metallique', 'menuiserie_aluminium', 'cloture_enduit', 'cloture_non_enduit', 'cloture_peinte']
     with open(yaml_path, 'r', encoding='utf-8') as f:
         classes = yaml.safe_load(f).get('classes', [])
     if '__background__' not in classes:
@@ -44,10 +44,12 @@ def load_classes(yaml_path="classes.yaml"):
 
 def load_colors(yaml_path="classes.yaml"):
     default = {
-        'panneau_solaire':    (255, 0,   0),
-        'batiment_peint':     (0,   255, 0),
-        'batiment_non_enduit':(0,   0,   255),
-        'batiment_enduit':    (255, 165, 0),
+        'panneau_solaire':       (255, 0,   0),
+        'menuiserie_metallique': (128, 0,   128),
+        'menuiserie_aluminium':  (0,   200, 200),
+        'cloture_enduit':        (255, 100, 0),
+        'cloture_non_enduit':    (150, 75,  0),
+        'cloture_peinte':        (255, 0,   150),
     }
     if not os.path.exists(yaml_path):
         return default
