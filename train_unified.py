@@ -46,9 +46,9 @@ except ImportError:
 # Poids d'oversampling pour les classes sous-representees (1.0 = pas d'effet)
 RARE_CLASS_WEIGHTS = {
     "panneau_solaire":       1.0,
-    "batiment_peint":        1.0,
+    "batiment_peint":        4.0,
     "batiment_enduit":       1.0,
-    "batiment_non_enduit":   1.0,
+    "batiment_non_enduit":   2.0,
     "menuiserie_metallique": 1.0,
 }
 

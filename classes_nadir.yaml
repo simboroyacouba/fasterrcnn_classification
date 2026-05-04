@@ -1,5 +1,3 @@
-# Classes modèle NADIR (orthophotos Production_*.png)
-
 classes:
 - __background__
 - panneau_solaire
@@ -9,4 +7,4 @@ colors:
   - 0
   - 0
 descriptions:
-  panneau_solaire: Tôle ondulée métallique
+  panneau_solaire: Tole ondulee metallique (vue nadir)

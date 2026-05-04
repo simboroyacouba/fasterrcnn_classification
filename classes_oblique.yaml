@@ -1,36 +1,28 @@
-# Classes modèle OBLIQUE (snapshots drone Snapshot_*.jpg)
-
 classes:
 - __background__
+- batiment_peint
+- batiment_non_enduit
+- batiment_enduit
 - menuiserie_metallique
-- menuiserie_aluminium
-- cloture_enduit
-- cloture_non_enduit
-- cloture_peinte
 colors:
+  batiment_peint:
+  - 0
+  - 255
+  - 0
+  batiment_non_enduit:
+  - 0
+  - 0
+  - 255
+  batiment_enduit:
+  - 255
+  - 165
+  - 0
   menuiserie_metallique:
-  - 128
-  - 0
-  - 128
-  menuiserie_aluminium:
-  - 0
-  - 200
-  - 200
-  cloture_enduit:
-  - 255
-  - 100
-  - 0
-  cloture_non_enduit:
-  - 150
-  - 75
-  - 0
-  cloture_peinte:
-  - 255
-  - 0
-  - 150
+  - 156
+  - 39
+  - 176
 descriptions:
-  menuiserie_metallique: Menuiserie en métal (fer, acier, etc.)
-  menuiserie_aluminium: Menuiserie en aluminium
-  cloture_enduit: Clôture avec enduit
-  cloture_non_enduit: Clôture sans enduit
-  cloture_peinte: Clôture peinte
+  batiment_peint: Tole bac acier (vue oblique)
+  batiment_non_enduit: Tuiles ou beton non enduit (vue oblique)
+  batiment_enduit: Dalle beton / toit plat (vue oblique)
+  menuiserie_metallique: Menuiserie en metal (vue oblique)
