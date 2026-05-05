@@ -19,6 +19,7 @@ import torch
 import torchvision.transforms.functional as TF
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from train_unified import inject_cbam
 from torch.utils.data import Dataset, DataLoader
 from pycocotools.coco import COCO
 from PIL import Image
@@ -66,13 +67,14 @@ def find_unified_model_and_test_info(output_base=None):
             print(f"   model_info_unified.json -> {model_path}")
             return model_path, test_info
 
-    # 2. Chercher le dossier fasterrcnn_unified_* le plus recent
+    # 2. Chercher le dossier fasterrcnn_unified_* ou fasterrcnn_cbam_* le plus recent
     for base in [output_base, "./runs/detect/train"]:
         if not os.path.exists(base):
             continue
         dirs = sorted(
             [d for d in os.listdir(base)
-             if os.path.isdir(os.path.join(base, d)) and d.startswith("fasterrcnn_unified_")],
+             if os.path.isdir(os.path.join(base, d))
+             and (d.startswith("fasterrcnn_unified_") or d.startswith("fasterrcnn_cbam_"))],
             reverse=True,
         )
         for d in dirs:
@@ -94,10 +96,12 @@ def find_unified_model_and_test_info(output_base=None):
 # MODELE
 # =============================================================================
 
-def build_model(num_classes):
+def build_model(num_classes, use_cbam=False):
     model = fasterrcnn_resnet50_fpn(weights=None)
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    if use_cbam:
+        inject_cbam(model)
     return model
 
 
@@ -107,15 +111,17 @@ def load_model(model_path, device):
     num_classes = checkpoint.get('num_classes', 6)
     classes     = checkpoint.get('classes', [])
     cat_mapping = checkpoint.get('cat_mapping', {})
+    use_cbam    = checkpoint.get('use_cbam', False)
 
-    model = build_model(num_classes)
+    model = build_model(num_classes, use_cbam=use_cbam)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
     model.eval()
 
     epoch = checkpoint.get('epoch', '?')
     map50 = checkpoint.get('map50', 0)
-    print(f"   Epoch {epoch} | mAP@50 val = {map50:.4f} | Classes : {classes}")
+    cbam_str = " | CBAM" if use_cbam else ""
+    print(f"   Epoch {epoch} | mAP@50 val = {map50:.4f} | Classes : {classes}{cbam_str}")
     return model, classes, cat_mapping
 
 
