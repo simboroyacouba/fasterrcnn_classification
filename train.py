@@ -84,10 +84,10 @@ CONFIG = {
     # oblique : surcharge avec les 4 classes oblique uniquement
     "rare_class_weights": {
         "panneau_solaire":       1.0,
-        "batiment_peint":        2.0,
-        "batiment_non_enduit":   2.0,
+        "batiment_peint":        1.0,
+        "batiment_non_enduit":   1.0,
         "batiment_enduit":       1.0,
-        "menuiserie_metallique": 2.0,
+        "menuiserie_metallique": 1.0,
     },
 
     # Chemins spécifiques par mode (surchargent annotations_file et classes_file)
