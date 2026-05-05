@@ -23,6 +23,7 @@ from datetime import datetime
 import time
 import gc
 import torch
+import torch.nn as nn
 from torchvision.models.detection import fasterrcnn_resnet50_fpn, FasterRCNN_ResNet50_FPN_Weights
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.transforms import ColorJitter
@@ -44,13 +45,89 @@ except ImportError:
 # =============================================================================
 
 # Poids d'oversampling pour les classes sous-representees (1.0 = pas d'effet)
+# RARE_CLASS_WEIGHTS = {
+#     "panneau_solaire":       1.0,
+#     "batiment_peint":        4.0,
+#     "batiment_enduit":       1.0,
+#     "batiment_non_enduit":   2.0,
+#     "menuiserie_metallique": 1.0,
+# }
+
 RARE_CLASS_WEIGHTS = {
     "panneau_solaire":       1.0,
-    "batiment_peint":        4.0,
+    "batiment_peint":        1.0,
     "batiment_enduit":       1.0,
-    "batiment_non_enduit":   2.0,
+    "batiment_non_enduit":   1.0,
     "menuiserie_metallique": 1.0,
 }
+
+
+# =============================================================================
+# ATTENTION — CBAM
+# =============================================================================
+
+class _ChannelAttention(nn.Module):
+    def __init__(self, in_channels, reduction=16):
+        super().__init__()
+        mid = max(in_channels // reduction, 1)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_channels, mid, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, in_channels, 1, bias=False),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        return x * self.sigmoid(self.fc(self.avg_pool(x)) + self.fc(self.max_pool(x)))
+
+
+class _SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg = x.mean(dim=1, keepdim=True)
+        mx, _ = x.max(dim=1, keepdim=True)
+        return x * self.sigmoid(self.conv(torch.cat([avg, mx], dim=1)))
+
+
+class CBAM(nn.Module):
+    def __init__(self, in_channels, reduction=16, kernel_size=7):
+        super().__init__()
+        self.ca = _ChannelAttention(in_channels, reduction)
+        self.sa = _SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        return self.sa(self.ca(x))
+
+
+# Canaux de sortie de chaque couche ResNet-50
+_CBAM_LAYER_CHANNELS = {"layer1": 256, "layer2": 512, "layer3": 1024, "layer4": 2048}
+
+
+class _CBAMResNetLayer(nn.Module):
+    """Enveloppe une couche ResNet avec un bloc CBAM insere apres."""
+    def __init__(self, layer, channels):
+        super().__init__()
+        self.layer = layer
+        self.cbam  = CBAM(channels)
+
+    def forward(self, x):
+        return self.cbam(self.layer(x))
+
+
+def inject_cbam(model):
+    """Injecte un bloc CBAM apres chaque couche ResNet-50 du backbone (layer1-4)."""
+    body = model.backbone.body
+    for layer_name, channels in _CBAM_LAYER_CHANNELS.items():
+        setattr(body, layer_name, _CBAMResNetLayer(getattr(body, layer_name), channels))
+    n = len(_CBAM_LAYER_CHANNELS)
+    print(f"   {n} blocs CBAM injectes apres les couches ResNet ({', '.join(_CBAM_LAYER_CHANNELS)})")
+    return model
 
 
 # =============================================================================
@@ -101,6 +178,7 @@ def build_config(args):
         "score_threshold":  float(os.getenv("SCORE_THRESHOLD", "0.5")),
         "pretrained":       os.getenv("PRETRAINED", "true").lower() == "true",
         "freeze_epochs":    args.freeze_epochs,
+        "use_cbam":         False,  # surcharge par --attention cbam
         "rare_class_weights": RARE_CLASS_WEIGHTS,
     }
 
@@ -298,11 +376,13 @@ def collate_fn(batch):
 # MODELE
 # =============================================================================
 
-def build_model(num_classes, pretrained=True):
+def build_model(num_classes, pretrained=True, use_cbam=False):
     weights = FasterRCNN_ResNet50_FPN_Weights.DEFAULT if pretrained else None
     model   = fasterrcnn_resnet50_fpn(weights=weights)
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    if use_cbam:
+        inject_cbam(model)
     return model
 
 
@@ -460,10 +540,17 @@ def train_fasterrcnn():
         type=int, default=0,
         help="Nombre d'epochs avec backbone gele (0 = desactive).",
     )
+    parser.add_argument(
+        "--attention",
+        choices=["none", "cbam"],
+        default="none",
+        help="Mecanisme d'attention insere apres chaque couche ResNet du backbone.",
+    )
     args = parser.parse_args()
 
     config = build_config(args)
-    config["classes"] = load_classes(config["classes_file"])
+    config["use_cbam"] = args.attention == "cbam"
+    config["classes"]  = load_classes(config["classes_file"])
     num_classes = len(config["classes"])
 
     print("=" * 70)
@@ -474,12 +561,14 @@ def train_fasterrcnn():
     print(f"   Classes     : {num_classes} (avec __background__)")
     print(f"   Epochs      : {config['num_epochs']} | Batch : {config['batch_size']} | LR : {config['learning_rate']}")
     print(f"   Freeze      : {config['freeze_epochs']} epochs")
+    print(f"   Attention   : {'CBAM (layer1-4)' if config['use_cbam'] else 'aucune'}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"   Device      : {device}")
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    train_dir   = os.path.join(config["output_dir"], f"fasterrcnn_unified_{timestamp}")
+    timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_suffix  = "cbam" if config["use_cbam"] else "unified"
+    train_dir   = os.path.join(config["output_dir"], f"fasterrcnn_{run_suffix}_{timestamp}")
     weights_dir = os.path.join(train_dir, "weights")
     os.makedirs(weights_dir, exist_ok=True)
 
@@ -539,14 +628,17 @@ def train_fasterrcnn():
 
     # Modele & Optimiseur
     print(f"\nChargement Faster R-CNN ResNet-50 FPN (pretrained={config['pretrained']})...")
-    model = build_model(num_classes, pretrained=config["pretrained"])
+    model = build_model(num_classes, pretrained=config["pretrained"], use_cbam=config["use_cbam"])
     model.to(device)
 
     freeze_epochs = config["freeze_epochs"]
     if freeze_epochs > 0:
         print(f"   Staged training : backbone gele pour les {freeze_epochs} premieres epochs")
+        if config["use_cbam"]:
+            print("   (blocs CBAM exclus du gel — initialises aleatoirement)")
         for name, param in model.named_parameters():
-            if "backbone" in name:
+            # Avec CBAM : geler ResNet mais laisser les blocs CBAM s'entrainer
+            if "backbone" in name and (not config["use_cbam"] or "cbam" not in name):
                 param.requires_grad = False
 
     params    = [p for p in model.parameters() if p.requires_grad]
@@ -620,6 +712,7 @@ def train_fasterrcnn():
                 'num_classes':        num_classes,
                 'classes':            classes,
                 'cat_mapping':        cat_mapping,
+                'use_cbam':           config["use_cbam"],
             }, os.path.join(weights_dir, "best.pth"))
             print(f"   Meilleur modele sauvegarde (mAP@50 : {best_map50:.4f})")
 
@@ -632,6 +725,7 @@ def train_fasterrcnn():
                 'num_classes':        num_classes,
                 'classes':            classes,
                 'cat_mapping':        cat_mapping,
+                'use_cbam':           config["use_cbam"],
             }, os.path.join(weights_dir, "last.pth"))
 
     total_time = time.time() - start_time
@@ -699,6 +793,7 @@ def train_fasterrcnn():
         'test_info':        os.path.join(train_dir, "test_info.json"),
         'classes':          classes,
         'image_size':       config["image_size"],
+        'use_cbam':         config["use_cbam"],
         'trained_at':       datetime.now().isoformat(),
     }
     info_path = os.path.join(config["output_dir"], "model_info_unified.json")

@@ -79,13 +79,15 @@ CONFIG = {
     "score_threshold":   float(os.getenv("SCORE_THRESHOLD", "0.5")),
     "pretrained":        os.getenv("PRETRAINED", "true").lower() == "true",
 
-    # Poids de sur-échantillonnage par classe (prend le max si plusieurs classes rares sur la même image)
+    # Poids de sur-échantillonnage par classe — mode "all" (prend le max si plusieurs classes sur la même image)
+    # nadir   : surcharge en {} (1 seule classe)
+    # oblique : surcharge avec les 4 classes oblique uniquement
     "rare_class_weights": {
+        "panneau_solaire":       1.0,
+        "batiment_peint":        2.0,
+        "batiment_non_enduit":   2.0,
+        "batiment_enduit":       1.0,
         "menuiserie_metallique": 2.0,
-        "menuiserie_aluminium":  2.0,
-        "cloture_enduit":        2.0,
-        "cloture_non_enduit":    2.0,
-        "cloture_peinte":        2.0,
     },
 
     # Chemins spécifiques par mode (surchargent annotations_file et classes_file)
@@ -503,7 +505,12 @@ def train_fasterrcnn():
         if CONFIG["oblique_annotations_file"]:
             CONFIG["annotations_file"] = CONFIG["oblique_annotations_file"]
         CONFIG["classes_file"] = CONFIG["oblique_classes_file"]
-        # rare_class_weights inchangé (poids égaux 2.0 pour les 5 classes oblique)
+        CONFIG["rare_class_weights"] = {
+            "batiment_peint":        2.0,
+            "batiment_non_enduit":   2.0,
+            "batiment_enduit":       1.0,
+            "menuiserie_metallique": 2.0,
+        }
 
     # Surcharges CLI (priorite maximale, apres le mode)
     if args.images_dir:
