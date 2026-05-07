@@ -92,30 +92,38 @@ def load_model(model_path, device):
 
 
 def _list_output_dirs(mode):
-    """
-    Retourne les paires (base, subdir) pour le mode donné, triées du plus récent.
-    Cherche dans OUTPUT_DIR puis dans runs/detect/train/ comme fallback.
-    """
     candidates = []
-    search_bases = [
-        os.getenv("OUTPUT_DIR", "./output"),
-        "./runs/detect/train",
-    ]
-    for base in search_bases:
-        if not os.path.exists(base):
-            continue
-        if mode != "all":
-            prefix = f"fasterrcnn_{mode}_"
+    base_output = os.getenv("OUTPUT_DIR", "./output")
+    search_bases = [base_output, "./runs/detect/train"]
+
+    if mode in ("nadir", "oblique"):
+        prefix = f"fasterrcnn_{mode}_"
+        # Dual mode: ./output/<mode>/fasterrcnn_<mode>_*
+        mode_subdir = os.path.join(base_output, mode)
+        if os.path.exists(mode_subdir):
+            dirs = [d for d in os.listdir(mode_subdir)
+                    if os.path.isdir(os.path.join(mode_subdir, d)) and d.startswith(prefix)]
+            for d in sorted(dirs, reverse=True):
+                candidates.append(os.path.join(mode_subdir, d))
+        # Legacy: root output or runs/detect/train
+        for base in search_bases:
+            if not os.path.exists(base):
+                continue
             dirs = [d for d in os.listdir(base)
                     if os.path.isdir(os.path.join(base, d)) and d.startswith(prefix)]
-        else:
+            for d in sorted(dirs, reverse=True):
+                candidates.append(os.path.join(base, d))
+    else:
+        for base in search_bases:
+            if not os.path.exists(base):
+                continue
             dirs = [d for d in os.listdir(base)
                     if os.path.isdir(os.path.join(base, d))
                     and d.startswith("fasterrcnn_")
                     and not d.startswith("fasterrcnn_nadir_")
                     and not d.startswith("fasterrcnn_oblique_")]
-        for d in sorted(dirs, reverse=True):
-            candidates.append(os.path.join(base, d))
+            for d in sorted(dirs, reverse=True):
+                candidates.append(os.path.join(base, d))
 
     return candidates
 
@@ -304,6 +312,117 @@ class MetricsCalculator:
         return results
 
 
+def _merge_calculators(calcs, iou_thresholds):
+    all_classes = []
+    seen = set()
+    for c in calcs:
+        for name in c.class_names:
+            if name not in seen:
+                all_classes.append(name)
+                seen.add(name)
+    merged = MetricsCalculator(['__background__'] + all_classes, iou_thresholds)
+    for calc in calcs:
+        for name in calc.class_names:
+            for t in iou_thresholds:
+                merged.tp[name][t] += calc.tp[name][t]
+                merged.fp[name][t] += calc.fp[name][t]
+                merged.fn[name][t] += calc.fn[name][t]
+        merged.all_ious.extend(calc.all_ious)
+    return merged
+
+
+def _run_mode_evaluation(mode, model_path_override, device):
+    model_path = model_path_override or find_model(mode)
+    if model_path is None or not os.path.exists(model_path):
+        return None
+
+    model, classes, cat_mapping = load_model(model_path, device)
+
+    test_info_path = None
+    sibling = os.path.join(os.path.dirname(model_path), "test_info.json")
+    if os.path.exists(sibling):
+        test_info_path = sibling
+    if test_info_path is None:
+        test_info_path = find_test_info(mode)
+    if test_info_path is None:
+        print(f"   test_info.json introuvable pour le mode '{mode}'!")
+        return None
+
+    with open(test_info_path, 'r') as f:
+        test_info = json.load(f)
+
+    images_dir      = test_info['images_dir']
+    ann_file        = test_info['annotations_file']
+    test_image_ids  = test_info['test_image_ids']
+    cat_mapping_int = ({int(k): v for k, v in cat_mapping.items()}
+                       if cat_mapping else
+                       {int(k): v for k, v in test_info['cat_mapping'].items()})
+
+    print(f"   Modele:   {model_path}")
+    print(f"   Test set: {len(test_image_ids)} images | Classes: {classes}")
+
+    test_dataset = TestDataset(images_dir, ann_file, test_image_ids,
+                               cat_mapping_int, CONFIG["image_size"])
+    test_loader  = DataLoader(test_dataset, batch_size=1, shuffle=False,
+                              collate_fn=collate_fn, num_workers=0)
+
+    calc = MetricsCalculator(classes, CONFIG["iou_thresholds"])
+    model.eval()
+    with torch.no_grad():
+        for imgs_batch, targets in tqdm(test_loader, desc=f"Eval {mode}"):
+            imgs    = [img.to(device) for img in imgs_batch]
+            outputs = model(imgs)
+            for output, target in zip(outputs, targets):
+                keep = output['scores'].cpu() >= CONFIG["score_threshold"]
+                pb = output['boxes'].cpu().numpy()[keep.numpy()]
+                pl = output['labels'].cpu().numpy()[keep.numpy()]
+                ps = output['scores'].cpu().numpy()[keep.numpy()]
+                gb = target['boxes'].numpy()
+                gl = target['labels'].numpy()
+                calc.add_image(pb, pl, ps, gb, gl)
+
+    return calc, classes, model_path, len(test_image_ids)
+
+
+def _print_save_results(results, output_dir, n_images, model_path, label=""):
+    title = f"RESULTATS SUR LE TEST SET{' — ' + label if label else ''}"
+    print("\n" + "=" * 70)
+    print(f"   {title}")
+    print("=" * 70)
+    print(f"   Images testees: {n_images}")
+    print(f"   mAP@50:    {results['mAP50']:.4f} ({results['mAP50']*100:.2f}%)")
+    print(f"   mAP@50:95: {results['mAP50_95']:.4f}")
+    print(f"   Precision: {results['overall']['iou_0.5']['Precision']:.4f}")
+    print(f"   Recall:    {results['overall']['iou_0.5']['Recall']:.4f}")
+    print(f"   F1-Score:  {results['overall']['iou_0.5']['F1']:.4f}")
+    print("=" * 70)
+    if results['mAP_per_class']:
+        print("\n   Par classe (IoU=0.5):")
+        for name in results['mAP_per_class']:
+            m = results['per_class'][name]['iou_0.5']
+            print(f"   {name:<30} P={m['Precision']:.3f} R={m['Recall']:.3f} F1={m['F1']:.3f}")
+
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "metrics_test_set.json"), 'w') as f:
+        json.dump(results, f, indent=2, default=float)
+    plot_metrics(results, output_dir)
+    with open(os.path.join(output_dir, "evaluation_report_test_set.txt"), 'w', encoding='utf-8') as f:
+        f.write(f"EVALUATION Faster R-CNN - TEST SET - {datetime.now()}\n")
+        f.write("=" * 50 + "\n\n")
+        f.write(f"Images testees: {n_images}\nModele: {model_path}\n\n")
+        f.write(f"mAP@50: {results['mAP50']:.4f} ({results['mAP50']*100:.2f}%)\n")
+        f.write(f"mAP@50:95: {results['mAP50_95']:.4f}\n")
+        f.write(f"Precision: {results['overall']['iou_0.5']['Precision']:.4f}\n")
+        f.write(f"Recall: {results['overall']['iou_0.5']['Recall']:.4f}\n")
+        f.write(f"F1-Score: {results['overall']['iou_0.5']['F1']:.4f}\n")
+        if results['mAP_per_class']:
+            f.write("\n\nPAR CLASSE (IoU=0.5)\n" + "-" * 50 + "\n")
+            for name in results['mAP_per_class']:
+                m = results['per_class'][name]['iou_0.5']
+                f.write(f"{name}: P={m['Precision']:.4f} R={m['Recall']:.4f} F1={m['F1']:.4f}\n")
+    print(f"\n   Resultats sauvegardes: {output_dir}")
+
+
 def plot_metrics(results, output_dir):
     os.makedirs(output_dir, exist_ok=True)
     class_names = list(results['mAP_per_class'].keys())
@@ -336,145 +455,82 @@ def plot_metrics(results, output_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluation Faster R-CNN")
-    parser.add_argument(
-        "--mode", choices=["nadir", "oblique", "all"], default="all",
-        help="nadir / oblique / all (defaut: all)"
-    )
+    parser.add_argument("--mode", choices=["nadir", "oblique", "all"],
+                        default="all", help="nadir / oblique / all (defaut: all)")
     parser.add_argument("--model", default=None, help="Chemin direct vers le modele .pth")
     args = parser.parse_args()
     mode = args.mode
 
-    # Surcharger classes_file selon le mode
+    print("=" * 70)
+    print(f"   EVALUATION Faster R-CNN - TEST SET (10%)")
+    print("=" * 70)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"   Device: {device}")
+
+    # -------------------------------------------------------------------------
+    # Mode "all" sans modele explicite : evaluer nadir + oblique et fusionner
+    # -------------------------------------------------------------------------
+    if mode == "all" and args.model is None and find_model("all") is None:
+        print("\n   Aucun modele unifie trouve → evaluation nadir + oblique\n")
+        collected = []
+
+        for sub_mode in ("nadir", "oblique"):
+            cf = (CONFIG["nadir_classes_file"] if sub_mode == "nadir"
+                  else CONFIG["oblique_classes_file"])
+            CONFIG["classes"] = load_classes(cf)
+            print(f"\n{'─'*50}")
+            print(f"   [{sub_mode.upper()}]")
+            print(f"{'─'*50}")
+            ret = _run_mode_evaluation(sub_mode, None, device)
+            if ret is None:
+                print(f"   Mode {sub_mode} ignore (modele ou test_info introuvable).")
+                continue
+            calc, classes, model_path, n_imgs = ret
+            collected.append({'calc': calc, 'classes': classes,
+                              'model_path': model_path, 'n_images': n_imgs, 'mode': sub_mode})
+
+        if not collected:
+            print("\n   Aucun modele trouve.")
+            print("   Lancez : python train.py --mode simple|attention|optimize|dual")
+            return
+
+        merged = _merge_calculators([r['calc'] for r in collected], CONFIG["iou_thresholds"])
+        results = merged.compute()
+        total  = sum(r['n_images'] for r in collected)
+        paths  = " + ".join(r['model_path'] for r in collected)
+        modes  = " + ".join(r['mode'] for r in collected)
+        results['evaluation_info'] = {
+            'dataset': f"TEST SET (10%) — {modes}",
+            'num_images': total, 'model_path': paths,
+            'timestamp': datetime.now().isoformat()
+        }
+        _print_save_results(results, os.path.join(CONFIG["output_dir"], "global"),
+                            total, paths, "GLOBAL (NADIR + OBLIQUE)")
+        return
+
+    # -------------------------------------------------------------------------
+    # Mode single : nadir, oblique, ou all avec un modele unifie
+    # -------------------------------------------------------------------------
     if mode == "nadir":
         CONFIG["classes_file"] = CONFIG["nadir_classes_file"]
     elif mode == "oblique":
         CONFIG["classes_file"] = CONFIG["oblique_classes_file"]
     CONFIG["classes"] = load_classes(CONFIG["classes_file"])
 
-    # Répertoire de sortie spécifique au mode
-    output_dir = os.path.join(CONFIG["output_dir"], mode)
-    os.makedirs(output_dir, exist_ok=True)
-
-    print("=" * 70)
-    print(f"   EVALUATION Faster R-CNN - TEST SET - Mode : {mode.upper()}")
-    print("=" * 70)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"   Device: {device}")
-
-    # Trouver le modèle
-    model_path = args.model or find_model(mode)
-    if model_path is None or not os.path.exists(model_path):
-        print(f"   Modele non trouve pour le mode '{mode}'.")
+    ret = _run_mode_evaluation(mode, args.model, device)
+    if ret is None:
+        print(f"\n   Modele non trouve pour le mode '{mode}'.")
         print("   Lancez : python train.py --mode " + mode)
         return
 
-    # Charger le modèle et récupérer les infos
-    model, classes, cat_mapping = load_model(model_path, device)
-
-    # Trouver test_info.json
-    test_info_path = None
-
-    # 1. Même répertoire que le modèle
-    sibling = os.path.join(os.path.dirname(model_path), "test_info.json")
-    if os.path.exists(sibling):
-        test_info_path = sibling
-
-    # 2. Dans output/fasterrcnn_{mode}_* (le plus récent)
-    if test_info_path is None:
-        test_info_path = find_test_info(mode)
-
-    if test_info_path is None:
-        print("   test_info.json non trouve! Lancez train.py --mode " + mode + " d'abord.")
-        return
-
-    with open(test_info_path, 'r') as f:
-        test_info = json.load(f)
-
-    images_dir       = test_info['images_dir']
-    annotations_file = test_info['annotations_file']
-    test_image_ids   = test_info['test_image_ids']
-    cat_mapping_int  = {int(k): v for k, v in cat_mapping.items()} if cat_mapping else {int(k): v for k, v in test_info['cat_mapping'].items()}
-
-    print(f"\n📋 Configuration:")
-    print(f"   Modèle:   {model_path}")
-    print(f"   Test set: {len(test_image_ids)} images")
-    print(f"   Classes:  {classes}")
-
-    # Dataset test
-    test_dataset = TestDataset(images_dir, annotations_file, test_image_ids, cat_mapping_int, CONFIG["image_size"])
-    test_loader  = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn, num_workers=0)
-
-    # Évaluation
-    print("\n📊 Évaluation sur le TEST SET...")
-    calc = MetricsCalculator(classes, CONFIG["iou_thresholds"])
-
-    model.eval()
-    with torch.no_grad():
-        for images, targets in tqdm(test_loader, desc="Test"):
-            images = [img.to(device) for img in images]
-            outputs = model(images)
-
-            for output, target in zip(outputs, targets):
-                keep = output['scores'].cpu() >= CONFIG["score_threshold"]
-                pred_boxes  = output['boxes'].cpu().numpy()[keep.numpy()]
-                pred_labels = output['labels'].cpu().numpy()[keep.numpy()]
-                pred_scores = output['scores'].cpu().numpy()[keep.numpy()]
-                gt_boxes    = target['boxes'].numpy()
-                gt_labels   = target['labels'].numpy()
-
-                calc.add_image(pred_boxes, pred_labels, pred_scores, gt_boxes, gt_labels)
-
+    calc, classes, model_path, n_images = ret
     results = calc.compute()
     results['evaluation_info'] = {
-        'dataset':    'TEST SET (10%)',
-        'num_images': len(test_image_ids),
-        'model_path': model_path,
-        'timestamp':  datetime.now().isoformat()
+        'dataset': 'TEST SET (10%)', 'num_images': n_images,
+        'model_path': model_path, 'timestamp': datetime.now().isoformat()
     }
-
-    # Affichage
-    print("\n" + "=" * 70)
-    print("   📊 RÉSULTATS SUR LE TEST SET")
-    print("=" * 70)
-    print(f"   Images testées: {len(test_image_ids)}")
-    print(f"   mAP@50:    {results['mAP50']:.4f} ({results['mAP50']*100:.2f}%)")
-    print(f"   mAP@50:95: {results['mAP50_95']:.4f}")
-    print(f"   Precision: {results['overall']['iou_0.5']['Precision']:.4f}")
-    print(f"   Recall:    {results['overall']['iou_0.5']['Recall']:.4f}")
-    print(f"   F1-Score:  {results['overall']['iou_0.5']['F1']:.4f}")
-    print("=" * 70)
-
-    if results['mAP_per_class']:
-        print("\n   Par classe (IoU=0.5):")
-        for name in results['mAP_per_class']:
-            m = results['per_class'][name]['iou_0.5']
-            print(f"   {name:<30} P={m['Precision']:.3f} R={m['Recall']:.3f} F1={m['F1']:.3f}")
-
-    # Sauvegarder
-    with open(os.path.join(output_dir, "metrics_test_set.json"), 'w') as f:
-        json.dump(results, f, indent=2, default=float)
-
-    plot_metrics(results, output_dir)
-
-    with open(os.path.join(output_dir, "evaluation_report_test_set.txt"), 'w', encoding='utf-8') as f:
-        f.write(f"ÉVALUATION Faster R-CNN - TEST SET - {datetime.now()}\n")
-        f.write("=" * 50 + "\n\n")
-        f.write(f"Images testées: {len(test_image_ids)}\n")
-        f.write(f"Modèle: {model_path}\n\n")
-        f.write(f"mAP@50: {results['mAP50']:.4f} ({results['mAP50']*100:.2f}%)\n")
-        f.write(f"mAP@50:95: {results['mAP50_95']:.4f}\n")
-        f.write(f"Precision: {results['overall']['iou_0.5']['Precision']:.4f}\n")
-        f.write(f"Recall: {results['overall']['iou_0.5']['Recall']:.4f}\n")
-        f.write(f"F1-Score: {results['overall']['iou_0.5']['F1']:.4f}\n")
-        if results['mAP_per_class']:
-            f.write("\n\nPAR CLASSE (IoU=0.5)\n")
-            f.write("-" * 50 + "\n")
-            for name in results['mAP_per_class']:
-                m = results['per_class'][name]['iou_0.5']
-                f.write(f"{name}: P={m['Precision']:.4f} R={m['Recall']:.4f} F1={m['F1']:.4f}\n")
-
-    print(f"\n   Resultats sauvegardes: {output_dir}")
+    _print_save_results(results, os.path.join(CONFIG["output_dir"], mode),
+                        n_images, model_path)
 
 
 if __name__ == "__main__":

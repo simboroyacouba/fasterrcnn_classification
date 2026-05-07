@@ -79,32 +79,51 @@ def build_model(num_classes):
 
 
 def find_best_model():
-    """Trouver automatiquement le meilleur modèle"""
+    """Trouve le meilleur modele disponible (unifie ou partiel dual)."""
     path = os.getenv("MODEL_PATH", None)
     if path and os.path.exists(path):
         return path
 
-    # Chercher dans runs/detect/train/ (dossier le plus récent en premier)
-    runs_base = os.path.join("runs", "detect", "train")
-    if os.path.exists(runs_base):
-        subdirs = sorted(
-            [d for d in os.listdir(runs_base) if os.path.isdir(os.path.join(runs_base, d))],
-            reverse=True
+    base_output = os.getenv("OUTPUT_DIR", "./output")
+    search_bases = [base_output, "./runs/detect/train"]
+
+    # Modes unifies en premier (simple, attention, optimize)
+    for base in search_bases:
+        if not os.path.exists(base):
+            continue
+        dirs = sorted(
+            [d for d in os.listdir(base)
+             if os.path.isdir(os.path.join(base, d))
+             and d.startswith("fasterrcnn_")
+             and not d.startswith("fasterrcnn_nadir_")
+             and not d.startswith("fasterrcnn_oblique_")],
+            reverse=True,
         )
-        for subdir in subdirs:
-            for fname in ["best_model.pth", "best.pth"]:
-                candidate = os.path.join(runs_base, subdir, fname)
+        for d in dirs:
+            for fname in ("best_model.pth", "best.pth"):
+                candidate = os.path.join(base, d, fname)
                 if os.path.exists(candidate):
-                    print(f"📁 Modèle trouvé: {candidate}")
+                    print(f"   Modele trouve: {candidate}")
                     return candidate
 
-    # Chercher dans output/
-    for root, dirs, files in os.walk("output"):
-        for fname in ["best_model.pth", "best.pth"]:
-            if fname in files:
-                found = os.path.join(root, fname)
-                print(f"📁 Modèle trouvé: {found}")
-                return found
+    # Dual : nadir puis oblique
+    for sub in ("nadir", "oblique"):
+        prefix = f"fasterrcnn_{sub}_"
+        mode_subdir = os.path.join(base_output, sub)
+        for base in ([mode_subdir] + search_bases):
+            if not os.path.exists(base):
+                continue
+            dirs = sorted(
+                [d for d in os.listdir(base)
+                 if os.path.isdir(os.path.join(base, d)) and d.startswith(prefix)],
+                reverse=True,
+            )
+            for d in dirs:
+                for fname in ("best_model.pth", "best.pth"):
+                    candidate = os.path.join(base, d, fname)
+                    if os.path.exists(candidate):
+                        print(f"   Modele {sub} trouve: {candidate}")
+                        return candidate
 
     return None
 
@@ -240,10 +259,23 @@ def generate_summary(reports, output_dir, total_time, classes):
 # MAIN
 # =============================================================================
 
+def _auto_find_input():
+    for candidate in (
+        os.getenv("DETECTION_INFERENCE_IMAGES_DIR", ""),
+        "./test_images",
+        "./images",
+        "../test",
+    ):
+        if candidate and os.path.isdir(candidate):
+            return candidate
+    return None
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Inférence Faster R-CNN")
-    parser.add_argument("--model",       default=None,    help="Chemin du modèle .pth (auto-détecté si absent)")
-    parser.add_argument("--input",       default=os.getenv("DETECTION_INFERENCE_IMAGES_DIR", "../test"))
+    parser = argparse.ArgumentParser(description="Inference Faster R-CNN")
+    parser.add_argument("--model",       default=None)
+    parser.add_argument("--input",       default=None,
+                        help="Dossier ou image (defaut: auto-detection)")
     parser.add_argument("--output",      default=os.getenv("PREDICTIONS_DIR", "./predictions"))
     parser.add_argument("--threshold",   type=float, default=float(os.getenv("SCORE_THRESHOLD", "0.5")))
     parser.add_argument("--image-size",  type=int,   default=int(os.getenv("IMAGE_SIZE", "640")))
@@ -256,12 +288,20 @@ def main():
     # Trouver le modèle
     if args.model is None:
         args.model = find_best_model()
-    if args.model is None or not os.path.exists(args.model):
-        print(f"❌ Modèle non trouvé: {args.model}")
+    if args.model is None or not os.path.exists(str(args.model or "")):
+        print("   Modele non trouve. Lancez : python train.py --mode simple|attention|optimize|dual")
+        return
+
+    if args.input is None:
+        args.input = _auto_find_input()
+    if args.input is None:
+        print("   Aucun dossier d'images trouve.")
+        print("   Utilisez : python inference.py --input /chemin/vers/images")
+        print("   Ou definir DETECTION_INFERENCE_IMAGES_DIR dans .env")
         return
 
     model, classes = load_model(args.model, device)
-    print(f"🧠 Modèle: {args.model} | Classes: {classes}")
+    print(f"   Modele: {args.model} | Classes: {classes}")
 
     os.makedirs(args.output, exist_ok=True)
 
