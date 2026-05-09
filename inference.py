@@ -63,6 +63,18 @@ CLASSES      = load_classes(CLASSES_FILE)
 COLORS       = load_colors(CLASSES_FILE)
 
 
+NADIR_PREFIX   = 'Production_'
+OBLIQUE_PREFIX = 'Snapshot_'
+
+
+def detect_image_mode(filename):
+    """Retourne 'nadir', 'oblique' ou 'both' selon le prefixe du nom de fichier."""
+    name = Path(filename).name
+    if name.startswith(NADIR_PREFIX):   return 'nadir'
+    if name.startswith(OBLIQUE_PREFIX): return 'oblique'
+    return 'both'
+
+
 def format_time(seconds):
     return f"{seconds*1000:.1f} ms" if seconds < 1 else f"{seconds:.2f} s"
 
@@ -78,54 +90,90 @@ def build_model(num_classes):
     return model
 
 
-def find_best_model():
-    """Trouve le meilleur modele disponible (unifie ou partiel dual)."""
+def _list_output_dirs(mode):
+    """Retourne les repertoires d'entrainement tries du plus recent, filtres par mode."""
+    candidates = []
+    base_output = os.getenv("OUTPUT_DIR", "./output")
+    runs_base   = os.getenv("RUNS_DIR",   "./runs/detect/train")
+
+    if mode in ("nadir", "oblique"):
+        prefix = f"fasterrcnn_{mode}_"
+        for base in (os.path.join(base_output, mode), os.path.join(runs_base, mode)):
+            if os.path.isdir(base):
+                dirs = sorted(
+                    [d for d in os.listdir(base)
+                     if os.path.isdir(os.path.join(base, d)) and d.startswith(prefix)],
+                    reverse=True,
+                )
+                for d in dirs:
+                    candidates.append(os.path.join(base, d))
+    else:
+        for base in (base_output, runs_base):
+            if os.path.isdir(base):
+                dirs = sorted(
+                    [d for d in os.listdir(base)
+                     if os.path.isdir(os.path.join(base, d))
+                     and d.startswith("fasterrcnn_")
+                     and not d.startswith("fasterrcnn_nadir_")
+                     and not d.startswith("fasterrcnn_oblique_")],
+                    reverse=True,
+                )
+                for d in dirs:
+                    candidates.append(os.path.join(base, d))
+
+    return candidates
+
+
+def find_best_model(mode="all"):
+    """Trouve le meilleur modele disponible."""
     path = os.getenv("MODEL_PATH", None)
     if path and os.path.exists(path):
         return path
 
-    base_output = os.getenv("OUTPUT_DIR", "./output")
-    search_bases = [base_output, "./runs/detect/train"]
+    subs = ("nadir", "oblique") if mode == "all" else (mode,)
 
-    # Modes unifies en premier (simple, attention, optimize)
-    for base in search_bases:
-        if not os.path.exists(base):
-            continue
-        dirs = sorted(
-            [d for d in os.listdir(base)
-             if os.path.isdir(os.path.join(base, d))
-             and d.startswith("fasterrcnn_")
-             and not d.startswith("fasterrcnn_nadir_")
-             and not d.startswith("fasterrcnn_oblique_")],
-            reverse=True,
-        )
-        for d in dirs:
-            for fname in ("best_model.pth", "best.pth"):
-                candidate = os.path.join(base, d, fname)
-                if os.path.exists(candidate):
-                    print(f"   Modele trouve: {candidate}")
-                    return candidate
+    # Mode specifique ou unified
+    for train_dir in _list_output_dirs(mode):
+        for fname in ("best_model.pth", "weights/best.pth", "best.pth"):
+            candidate = os.path.join(train_dir, fname)
+            if os.path.exists(candidate):
+                print(f"   Modele trouve: {candidate}")
+                return candidate
 
-    # Dual : nadir puis oblique
-    for sub in ("nadir", "oblique"):
-        prefix = f"fasterrcnn_{sub}_"
-        mode_subdir = os.path.join(base_output, sub)
-        for base in ([mode_subdir] + search_bases):
-            if not os.path.exists(base):
-                continue
-            dirs = sorted(
-                [d for d in os.listdir(base)
-                 if os.path.isdir(os.path.join(base, d)) and d.startswith(prefix)],
-                reverse=True,
-            )
-            for d in dirs:
-                for fname in ("best_model.pth", "best.pth"):
-                    candidate = os.path.join(base, d, fname)
-                    if os.path.exists(candidate):
-                        print(f"   Modele {sub} trouve: {candidate}")
-                        return candidate
+    # Fallback dual si mode == all
+    if mode == "all":
+        found = {}
+        for sub in ("nadir", "oblique"):
+            for train_dir in _list_output_dirs(sub):
+                for fname in ("best_model.pth", "weights/best.pth", "best.pth"):
+                    candidate = os.path.join(train_dir, fname)
+                    if os.path.exists(candidate) and sub not in found:
+                        found[sub] = candidate
+        if found:
+            print(f"   Aucun modele unifie trouve. Modeles partiels detectes: {list(found.keys())}")
+            print(f"   Utilisez --mode nadir ou --mode oblique pour choisir le bon modele.")
+            # Preferer oblique (plus de classes) si disponible
+            for sub in ("oblique", "nadir"):
+                if sub in found:
+                    print(f"   Selection automatique: {sub} → {found[sub]}")
+                    return found[sub]
 
     return None
+
+
+def find_both_models():
+    """Trouve les modeles nadir et oblique disponibles (pour --mode all dual)."""
+    found = {}
+    for sub in ("nadir", "oblique"):
+        for train_dir in _list_output_dirs(sub):
+            for fname in ("best_model.pth", "weights/best.pth", "best.pth"):
+                candidate = os.path.join(train_dir, fname)
+                if os.path.exists(candidate):
+                    found[sub] = candidate
+                    break
+            if sub in found:
+                break
+    return found
 
 
 def load_model(model_path, device):
@@ -134,9 +182,11 @@ def load_model(model_path, device):
     classes     = checkpoint.get('classes', CLASSES)
 
     model = build_model(num_classes)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     model.to(device)
     model.eval()
+
+    print(f"   Classes ({len(classes)}): {classes}")
     return model, classes
 
 
@@ -274,23 +324,18 @@ def _auto_find_input():
 def main():
     parser = argparse.ArgumentParser(description="Inference Faster R-CNN")
     parser.add_argument("--model",       default=None)
+    parser.add_argument("--mode",        choices=["nadir", "oblique", "all"], default="all",
+                        help="Sous-mode pour auto-detection du modele")
     parser.add_argument("--input",       default=None,
                         help="Dossier ou image (defaut: auto-detection)")
     parser.add_argument("--output",      default=os.getenv("PREDICTIONS_DIR", "./predictions"))
     parser.add_argument("--threshold",   type=float, default=float(os.getenv("SCORE_THRESHOLD", "0.5")))
     parser.add_argument("--image-size",  type=int,   default=int(os.getenv("IMAGE_SIZE", "640")))
-    parser.add_argument("--no-display",  action="store_true")
+    parser.add_argument("--display",     action="store_true", default=False)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"   Device: {device}")
-
-    # Trouver le modèle
-    if args.model is None:
-        args.model = find_best_model()
-    if args.model is None or not os.path.exists(str(args.model or "")):
-        print("   Modele non trouve. Lancez : python train.py --mode simple|attention|optimize|dual")
-        return
 
     if args.input is None:
         args.input = _auto_find_input()
@@ -300,11 +345,6 @@ def main():
         print("   Ou definir DETECTION_INFERENCE_IMAGES_DIR dans .env")
         return
 
-    model, classes = load_model(args.model, device)
-    print(f"   Modele: {args.model} | Classes: {classes}")
-
-    os.makedirs(args.output, exist_ok=True)
-
     input_path = Path(args.input)
     if input_path.is_dir():
         images = sorted([p for p in input_path.iterdir()
@@ -312,17 +352,74 @@ def main():
     else:
         images = [input_path]
 
+    os.makedirs(args.output, exist_ok=True)
+
+    # ── Chargement du ou des modeles ─────────────────────────────────────────
+    # Mode all sans modele explicite → routing dual nadir/oblique
+    dual_mode = False
+    models_map   = {}   # {'nadir': model, 'oblique': model}
+    classes_map  = {}   # {'nadir': classes, 'oblique': classes}
+
+    if args.model is not None:
+        if not os.path.exists(args.model):
+            print(f"   Modele introuvable : {args.model}"); return
+        model, classes = load_model(args.model, device)
+        print(f"   Modele: {args.model} | Classes: {classes}")
+    elif args.mode == "all":
+        both = find_both_models()
+        if not both:
+            # Tentative modele unifie
+            unified = find_best_model("all")
+            if unified:
+                model, classes = load_model(unified, device)
+                print(f"   Modele unifie: {unified} | Classes: {classes}")
+            else:
+                print("   Modele non trouve. Lancez : python train.py --mode dual"); return
+        else:
+            dual_mode = True
+            for sub, path in both.items():
+                m, cls = load_model(path, device)
+                models_map[sub]  = m
+                classes_map[sub] = cls
+                print(f"   {sub}: {path}")
+            if len(both) == 1:
+                print(f"   ⚠  Seul le modele {list(both.keys())[0]} disponible.")
+    else:
+        path = find_best_model(args.mode)
+        if path is None or not os.path.exists(str(path or "")):
+            print("   Modele non trouve. Lancez : python train.py --mode simple|attention|optimize|dual")
+            return
+        model, classes = load_model(path, device)
+        print(f"   Modele: {path} | Classes: {classes}")
+
     print(f"🖼️  {len(images)} image(s)\n")
 
-    reports    = []
+    reports     = []
     start_total = time.time()
 
     for idx, img_path in enumerate(images, 1):
         print(f"[{idx}/{len(images)}] 🔍 {img_path.name}")
-        image, preds = predict(model, str(img_path), classes, device, args.threshold, args.image_size)
+
+        if dual_mode:
+            img_mode = detect_image_mode(img_path.name)
+            if img_mode == 'nadir' and 'nadir' in models_map:
+                cur_model, cur_classes = models_map['nadir'],   classes_map['nadir']
+            elif img_mode == 'oblique' and 'oblique' in models_map:
+                cur_model, cur_classes = models_map['oblique'], classes_map['oblique']
+            elif models_map:
+                # Prefixe inconnu : prendre le premier disponible
+                key = list(models_map.keys())[0]
+                cur_model, cur_classes = models_map[key], classes_map[key]
+            else:
+                print(f"   ⚠  Aucun modele disponible pour {img_path.name}"); continue
+        else:
+            cur_model, cur_classes = model, classes
+
+        image, preds = predict(cur_model, str(img_path), cur_classes, device,
+                               args.threshold, args.image_size)
         out_img = os.path.join(args.output, f"{img_path.stem}_fasterrcnn.png")
-        visualize(image, preds, out_img, show=not args.no_display)
-        report = generate_report(preds, img_path.name, classes)
+        visualize(image, preds, out_img, show=args.display)
+        report = generate_report(preds, img_path.name, cur_classes)
         reports.append(report)
         print(f"   ✅ {report['total_objects']} objets | ⏱️ {report['inference_time_ms']:.1f} ms")
 
@@ -330,7 +427,9 @@ def main():
         json.dump(reports, f, indent=2)
 
     if len(images) > 1:
-        summary = generate_summary(reports, args.output, time.time() - start_total, classes)
+        # Pour le résumé, utiliser classes unifiées ou celles du premier modele
+        summary_classes = (list(classes_map.values())[0] if dual_mode else classes)
+        summary = generate_summary(reports, args.output, time.time() - start_total, summary_classes)
         print(f"\n📊 Résumé: {summary['total_objects']} objets | {summary['avg_inference_ms']:.1f} ms/image")
 
     print(f"\n📁 Résultats: {args.output}")
